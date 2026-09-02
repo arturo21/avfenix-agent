@@ -2,7 +2,7 @@
 import os
 import sys
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
@@ -25,29 +25,32 @@ VECTOR_STORE_PATH = os.path.join(UPLOAD_FOLDER, "vector_index.pkl")
 vector_store = SimpleVectorStore(storage_path=VECTOR_STORE_PATH)
 processor = DocumentProcessor(min_chunk_size=300, max_chunk_size=1200, threshold=0.15)
 
-# Lista negra de modelos gratuitos que sabemos que fallan, están rotos o devuelven None
+# Guardamos en caché el modelo seleccionado para evitar latencias en cada mensaje del chat
+cached_free_model = None
+
+# Lista de modelos inestables o problemáticos que queremos excluir del carrusel dinámico
 BLACKLIST_MODELS = [
     "inclusionai/ling-3.0-flash-fin:free",
-    "inclusionai/ling-3.0-flash:free",
-    "undaligned/llama-3-8b-instruct:free"
+    "undaligned/llama-3-8b-instruct:free",
+    "fargolabs/llama-3-8b-instruct-fp16:free"
 ]
 
-# Cacheamos la lista ordenada de modelos gratuitos para no consultar la API en cada mensaje
-cached_ranked_models = []
-
-def get_ranked_free_models():
+def get_available_free_model():
     """
-    Consulta la API de OpenRouter de manera rápida para obtener la lista de modelos
-    gratuitos activos, los filtra quitando la lista negra y los ordena priorizando
-    los más estables y de mayor rendimiento para español.
+    Consulta la API de OpenRouter de manera rápida para detectar qué modelos
+    gratuitos están activos, estables y disponibles.
+    Implementa una lista negra y una caché en memoria para máxima velocidad.
     """
-    global cached_ranked_models
+    global cached_free_model
     
-    # Si ya lo consultamos y logramos armar la caché, la reutilizamos
-    if cached_ranked_models:
-        return cached_ranked_models
+    # Si ya lo consultamos previamente en esta sesión, retornamos el resultado cacheado
+    if cached_free_model:
+        return cached_free_model
 
-    # Lista preferente de modelos gratuitos estables de alta calidad (ordenados por prioridad)
+    fallback_model = "google/gemini-2.5-flash:free"
+    url = "https://openrouter.ai/api/v1/models"
+    
+    # Lista de modelos gratuitos estables de alta calidad (orden de prioridad)
     stable_free_priority = [
         "google/gemini-2.5-flash:free",
         "meta-llama/llama-3.3-70b-instruct:free",
@@ -58,23 +61,23 @@ def get_ranked_free_models():
         "microsoft/phi-3-medium-128k-instruct:free"
     ]
     
-    url = "https://openrouter.ai/api/v1/models"
     try:
-        # Petición rápida con un timeout de 4 segundos
+        # Hacemos una consulta rápida con un timeout estricto de 4 segundos para no bloquear la app
         response = requests.get(url, timeout=4)
         if response.status_code == 200:
             models_data = response.json().get("data", [])
-            detected_free_models = []
+            free_models = []
             
             for model in models_data:
                 model_id = model.get("id", "")
-                pricing = model.get("pricing", {})
                 
-                # Omitir modelos que están explícitamente en la lista negra
+                # Ignorar modelos en lista negra
                 if model_id in BLACKLIST_MODELS:
                     continue
+                    
+                pricing = model.get("pricing", {})
                 
-                # Evaluar costos de prompt y completion
+                # Evaluamos los costos del modelo (tanto para prompt como para completion)
                 try:
                     prompt_cost = float(pricing.get("prompt", 1))
                     completion_cost = float(pricing.get("completion", 1))
@@ -82,33 +85,29 @@ def get_ranked_free_models():
                     prompt_cost = 1.0
                     completion_cost = 1.0
                 
-                # Es gratis si el costo es 0 o si termina con ':free'
+                # Un modelo es considerado gratis si sus costos de API son cero o termina en ':free'
                 if (prompt_cost == 0.0 and completion_cost == 0.0) or model_id.endswith(":free"):
-                    detected_free_models.append(model_id)
+                    free_models.append(model_id)
             
-            if detected_free_models:
-                # Ordenar los modelos detectados basándose en nuestra prioridad estable
-                ranked_list = []
-                # 1. Agregamos los que están en nuestra lista de estabilidad (siempre que OpenRouter diga que están gratis y activos)
+            if free_models:
+                # 1. Buscamos el primer modelo disponible que coincida con nuestra lista de prioridad estable
                 for preferred in stable_free_priority:
-                    if preferred in detected_free_models:
-                        ranked_list.append(preferred)
+                    if preferred in free_models:
+                        cached_free_model = preferred
+                        print(f"[*] Modelo gratuito recomendado seleccionado: {cached_free_model}")
+                        return cached_free_model
                 
-                # 2. Agregamos el resto de modelos gratis que no estaban en nuestra lista de prioridad
-                for detected in detected_free_models:
-                    if detected not in ranked_list:
-                        ranked_list.append(detected)
-                
-                cached_ranked_models = ranked_list
-                print(f"[*] Modelos gratuitos detectados y ordenados por prioridad: {cached_ranked_models}")
-                return cached_ranked_models
+                # 2. Si ninguno de los preferidos está libre, tomamos el primero disponible de la lista general
+                cached_free_model = free_models[0]
+                print(f"[*] Modelo gratuito genérico seleccionado: {cached_free_model}")
+                return cached_free_model
                 
     except Exception as e:
-        print(f"[!] Advertencia al consultar modelos de OpenRouter: {e}. Usando lista por defecto.")
+        print(f"[!] Advertencia al consultar modelos en OpenRouter: {e}. Usando fallback por defecto.")
     
-    # Si hay un fallo de red o la API no responde, usamos nuestra lista estática confiable
-    cached_ranked_models = stable_free_priority
-    return cached_ranked_models
+    # En caso de error o de no encontrar modelos libres, usamos el fallback
+    cached_free_model = fallback_model
+    return cached_free_model
 
 
 # Manejo manual de CORS en Flask (flask_cors no está disponible)
@@ -128,12 +127,10 @@ def handle_options(*args, **kwargs):
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    models = get_ranked_free_models()
     return jsonify({
         "status": "healthy", 
         "database_chunks": len(vector_store.chunks),
-        "primary_free_model": models[0] if models else "None",
-        "available_free_models_count": len(models)
+        "active_free_model": get_available_free_model()
     }), 200
 
 @app.route('/api/documents', methods=['GET'])
@@ -152,8 +149,10 @@ def delete_document(filename):
     if not filename:
         return jsonify({"error": "Nombre de archivo no proporcionado"}), 400
         
+    # Eliminar de la base vectorial
     deleted_chunks = vector_store.delete_by_filename(filename)
     
+    # Intentar eliminar el archivo físico de uploads
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
     file_deleted = False
     if os.path.exists(file_path):
@@ -186,15 +185,20 @@ def upload_file():
     if ext not in ['pdf', 'docx', 'doc']:
         return jsonify({"error": "Solo se permiten formatos PDF y DOCX (.docx/.doc)"}), 400
         
+    # Guardar archivo temporalmente
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
     
     try:
+        # Procesar y fragmentar semánticamente el documento
         chunks = processor.process_file(file_path)
+        
         if not chunks:
             return jsonify({"error": f"No se pudo extraer texto legible del archivo '{filename}'."}), 422
             
+        # Indexar chunks en la base vectorial
         vector_store.add_chunks(chunks)
+        
         return jsonify({
             "message": f"Archivo '{filename}' procesado e indexado con éxito.",
             "chunks_count": len(chunks),
@@ -203,6 +207,7 @@ def upload_file():
         
     except Exception as e:
         print(f"Error procesando el archivo {filename}: {e}")
+        # Limpieza si falla
         if os.path.exists(file_path):
             os.remove(file_path)
         return jsonify({"error": f"Error interno al procesar el documento: {str(e)}"}), 500
@@ -211,12 +216,11 @@ def upload_file():
 def chat():
     """
     Endpoint principal del chat RAG. Realiza búsqueda vectorial y consulta a OpenRouter.
-    Prueba dinámicamente múltiples modelos gratuitos disponibles en orden de estabilidad
-    para recuperarse de forma invisible de caídas, bloqueos o respuestas vacías (None).
+    Soporta opcionalmente output_mode = text / audio / both.
     """
     data = request.json or {}
     message = data.get("message", "").strip()
-    output_mode = data.get("output_mode", "text")
+    output_mode = data.get("output_mode", "text") # text, audio, both
     
     if not message:
         return jsonify({"error": "El mensaje no puede estar vacío"}), 400
@@ -262,10 +266,18 @@ def chat():
         f"CONTEXTO AUTORIZADO:\n{context_text}"
     )
 
-    # 4. Obtener la lista ordenada y filtrada de modelos gratuitos disponibles
-    models_to_try = get_ranked_free_models()
+    # 4. Obtener dinámicamente el modelo gratuito disponible en OpenRouter
+    model_name = get_available_free_model()
 
-    # 5. Llamar a la API de OpenRouter con reintento secuencial
+    # 5. Configurar el tamaño máximo de respuesta dinámica (Evitar recortes)
+    # Buscamos en el .env la variable OPENROUTER_MAX_TOKENS. Si no está configurada,
+    # ampliamos de 800 a 2000 tokens por defecto para permitir respuestas ricas y detalladas.
+    try:
+        max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", 2000))
+    except (ValueError, TypeError):
+        max_tokens = 2000
+
+    # 6. Llamar a la API de OpenRouter
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         return jsonify({
@@ -281,71 +293,77 @@ def chat():
     }
     
     payload = {
+        "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message}
         ],
-        "temperature": 0.1,  # Baja creatividad para evitar alucinaciones
-        "max_tokens": 800
+        "temperature": 0.1,  # Temperatura baja para evitar alucinaciones y respuestas creativas
+        "max_tokens": max_tokens
     }
     
     ai_response = None
-    last_error = "No se encontraron modelos gratuitos de OpenRouter activos o disponibles."
-    used_model = None
-
-    # Algoritmo de reintento secuencial invisible al usuario
-    for model_name in models_to_try:
-        print(f"[*] Probando consulta con el modelo gratuito: {model_name}")
-        payload["model"] = model_name
+    try:
+        response = requests.post(openrouter_url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        res_json = response.json()
         
-        try:
-            response = requests.post(openrouter_url, json=payload, headers=headers, timeout=25)
-            response.raise_for_status()
-            res_json = response.json()
+        choices = res_json.get('choices', [])
+        if not choices:
+            err_msg = res_json.get('error', {}).get('message', 'No se recibieron opciones válidas del modelo.')
+            raise ValueError(f"OpenRouter devolvió un error: {err_msg}")
             
-            choices = res_json.get('choices', [])
-            if not choices:
-                err_msg = res_json.get('error', {}).get('message', 'OpenRouter no devolvió opciones.')
-                raise ValueError(f"Fallo de generación: {err_msg}")
+        message_data = choices[0].get('message', {})
+        ai_response_raw = message_data.get('content')
+        
+        if ai_response_raw is None:
+            raise ValueError("El modelo devolvió una respuesta nula (None), posiblemente por bloqueo de seguridad o fallo interno.")
+            
+        ai_response = ai_response_raw.strip()
+        if not ai_response:
+            raise ValueError("El modelo devolvió un texto vacío.")
+            
+    except Exception as e:
+        print(f"Error al llamar a OpenRouter usando el modelo primario {model_name}: {e}")
+        
+        # MECANISMO DE RESPALDO DE EMERGENCIA: Si el modelo dinámico falló o devolvió None,
+        # reintentamos de forma automática e inmediata con el modelo ultra-estable de Gemini 2.5 Flash Free.
+        if model_name != "google/gemini-2.5-flash:free":
+            print("[*] Reintentando llamada de emergencia inmediata con google/gemini-2.5-flash:free...")
+            try:
+                payload["model"] = "google/gemini-2.5-flash:free"
+                payload["max_tokens"] = max_tokens
+                fallback_response = requests.post(openrouter_url, json=payload, headers=headers, timeout=30)
+                fallback_response.raise_for_status()
+                fallback_json = fallback_response.json()
                 
-            message_data = choices[0].get('message', {})
-            ai_response_raw = message_data.get('content')
-            
-            if ai_response_raw is None:
-                raise ValueError("El modelo devolvió una respuesta nula (None).")
-                
-            ai_response_cleaned = ai_response_raw.strip()
-            if not ai_response_cleaned:
-                raise ValueError("El modelo devolvió un texto vacío.")
-            
-            # Si tiene éxito y devuelve contenido válido, guardamos la respuesta y detenemos el ciclo
-            ai_response = ai_response_cleaned
-            used_model = model_name
-            print(f"[+] Éxito total en la consulta usando: {used_model}")
-            break
-            
-        except Exception as e:
-            print(f"[!] El modelo gratuito '{model_name}' falló debido a: {e}. Probando el siguiente modelo en la cola...")
-            last_error = str(e)
-            continue
+                fallback_choices = fallback_json.get('choices', [])
+                if fallback_choices:
+                    fallback_content = fallback_choices[0].get('message', {}).get('content')
+                    if fallback_content is not None:
+                        ai_response = fallback_content.strip()
+                        print("[*] Reintento de emergencia exitoso usando google/gemini-2.5-flash:free")
+                        return jsonify({
+                            "response": ai_response,
+                            "sources": sources,
+                            "audio_url": None,
+                            "note": "Nota: Se utilizó un modelo de respaldo debido a un fallo en el modelo dinámico primario."
+                        }), 200
+            except Exception as inner_e:
+                print(f"[!] Falló también el reintento de emergencia: {inner_e}")
+        
+        # Si fallaron todas las opciones, devolvemos un mensaje de error estructurado
+        return jsonify({"error": f"Error de comunicación con el motor de IA ({model_name}): {str(e)}"}), 502
 
-    # Si se recorrieron todos los modelos y ninguno pudo responder con éxito
-    if ai_response is None:
-        print(f"[CRÍTICO] Todos los modelos gratuitos de OpenRouter fallaron. Último error registrado: {last_error}")
-        return jsonify({
-            "error": f"Todos los modelos gratuitos fallaron. Último error: {last_error}. Por favor, verifica el estado de tu cuenta de OpenRouter o tus límites diarios."
-        }), 502
-
-    # 6. Pipeline de Voz (Kokoro / TTS alternativo)
+    # 7. Pipeline de Voz (Kokoro / TTS alternativo)
     audio_url = None
-    if output_mode in ["audio", "both"]:
+    if output_mode in ["audio", "both"] and ai_response:
         audio_url = f"/api/tts?text={requests.utils.quote(ai_response[:200])}"
 
     return jsonify({
         "response": ai_response,
         "sources": sources,
-        "audio_url": audio_url,
-        "model_used": used_model
+        "audio_url": audio_url
     }), 200
 
 @app.route('/api/tts', methods=['GET'])
