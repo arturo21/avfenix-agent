@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AVFenix - Panel Administrativo & RAG Playground</title>
+    <!-- Tailwind CSS para diseño profesional -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#f0f9ff',
+                            100: '#e0f2fe',
+                            500: '#0284c7',
+                            600: '#0369a1',
+                            700: '#1d4ed8',
+                            800: '#1e40af',
+                            900: '#1e3a8a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-50 font-sans min-h-screen flex flex-col">
+
+    <!-- HEADER / BARRA DE NAVEGACIÓN -->
+    <header class="bg-primary-900 text-white shadow-md py-4 px-6 flex justify-between items-center">
+        <div class="flex items-center space-x-3">
+            <svg class="w-8 h-8 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path>
+            </svg>
+            <div>
+                <h1 class="text-xl font-bold tracking-tight">AVFenix Agent</h1>
+                <p class="text-xs text-sky-300">Administrador de Base de Conocimientos RAG</p>
+            </div>
+        </div>
+
+        <div class="flex items-center space-x-6">
+            <!-- Selector de URL de API -->
+            <div class="flex items-center space-x-2 bg-primary-800 rounded px-3 py-1.5 border border-primary-700">
+                <span class="text-xs text-primary-200 font-medium">API:</span>
+                <input id="api-url" type="text" value="http://localhost:5000" class="bg-transparent border-none text-white text-xs focus:ring-0 focus:outline-none w-44 font-mono" placeholder="http://localhost:5000">
+            </div>
+
+            <!-- Indicador de Conexión -->
+            <div class="flex items-center space-x-2">
+                <span id="conn-indicator" class="w-3.5 h-3.5 rounded-full bg-red-500 animate-pulse"></span>
+                <span id="conn-text" class="text-xs font-semibold text-gray-300">Desconectado</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- CUERPO PRINCIPAL (DISEÑO GRID) -->
+    <main class="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        <!-- PANEL IZQUIERDO: BASE DE CONOCIMIENTOS (COL: 5) -->
+        <section class="lg:col-span-5 flex flex-col space-y-6">
+            
+            <!-- TARJETA 1: CARGA DE ARCHIVOS -->
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
+                <h2 class="text-lg font-bold text-gray-800 mb-2 flex items-center">
+                    <svg class="w-5 h-5 text-primary-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                    </svg>
+                    Cargar Documentos
+                </h2>
+                <p class="text-xs text-gray-500 mb-4">Sube tus archivos PDF o DOCX. El agente los dividirá en secciones semánticas de manera automática.</p>
+                
+                <!-- Zona Dropzone -->
+                <div id="dropzone" class="border-2 border-dashed border-gray-300 hover:border-primary-500 rounded-xl p-8 flex flex-col items-center justify-center cursor-pointer transition bg-gray-50 hover:bg-primary-50">
+                    <input type="file" id="file-input" accept=".pdf,.docx" class="hidden">
+                    <svg class="w-12 h-12 text-gray-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                    <span class="text-sm font-semibold text-gray-700">Arrastra aquí tu archivo</span>
+                    <span class="text-xs text-gray-400 mt-1">Soporta PDF o Word (.docx) hasta 20MB</span>
+                    <button class="mt-4 px-4 py-2 bg-primary-600 text-white rounded-lg text-xs font-semibold hover:bg-primary-700 shadow-sm transition">Seleccionar Archivo</button>
+                </div>
+
+                <!-- Barra de progreso de carga -->
+                <div id="progress-container" class="mt-4 hidden">
+                    <div class="flex justify-between text-xs text-gray-600 mb-1">
+                        <span id="upload-status-text">Procesando y dividiendo...</span>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-1.5">
+                        <div id="progress-bar" class="bg-primary-600 h-1.5 rounded-full transition-all" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <!-- Notificación de carga -->
+                <div id="upload-feedback" class="mt-4 text-xs font-medium text-center hidden p-2.5 rounded"></div>
+            </div>
+
+            <!-- TARJETA 2: LISTADO DE ARCHIVOS cargados -->
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-5 flex-1 flex flex-col">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-bold text-gray-800 flex items-center">
+                        <svg class="w-5 h-5 text-primary-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
+                        </svg>
+                        Archivos Indexados
+                    </h2>
+                    <span id="doc-count" class="bg-primary-100 text-primary-800 text-xs font-bold px-2 py-0.5 rounded-full">0</span>
+                </div>
+                
+                <p class="text-xs text-gray-500 mb-4">Los siguientes archivos componen la memoria a la que el agente se ceñirá estrictamente.</p>
+                
+                <!-- Lista scrollable -->
+                <div class="flex-1 overflow-y-auto max-h-[350px] pr-1 space-y-2" id="document-list">
+                    <!-- Estado vacío por defecto -->
+                    <div id="empty-docs" class="text-center py-10">
+                        <svg class="w-10 h-10 text-gray-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
+                        </svg>
+                        <p class="text-xs font-medium text-gray-400">Ningún documento cargado en el agente.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- PANEL DERECHO: PLAYGROUND / PRUEBAS DE CHAT (COL: 7) -->
+        <section class="lg:col-span-7 bg-white rounded-xl shadow-sm border border-gray-100 flex flex-col overflow-hidden h-[600px] lg:h-auto">
+            
+            <!-- Cabecera del Chat -->
+            <div class="p-4 border-b border-gray-100 bg-gray-50 flex justify-between items-center">
+                <div class="flex items-center space-x-3">
+                    <div class="w-10 h-10 rounded-full bg-primary-100 flex items-center justify-center text-primary-600 font-bold">AV</div>
+                    <div>
+                        <h3 class="text-sm font-bold text-gray-800">Prueba tu Agente</h3>
+                        <p class="text-xs text-green-500 font-medium">Búsqueda Semántica Vectorial Activa</p>
+                    </div>
+                </div>
+                
+                <!-- Selector de Tipo de Salida -->
+                <div class="flex items-center space-x-1 bg-white rounded-lg border border-gray-200 px-2 py-1">
+                    <label class="text-[10px] font-bold text-gray-500 uppercase px-1">Respuesta:</label>
+                    <select id="chat-mode" class="text-xs border-none bg-transparent focus:ring-0 focus:outline-none cursor-pointer pr-5 py-0.5 font-medium">
+                        <option value="text">Solo Texto</option>
+                        <option value="audio">Solo Audio</option>
+                        <option value="both">Texto + Audio</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Caja de Mensajes -->
+            <div id="chat-box" class="flex-1 overflow-y-auto p-5 space-y-4 bg-gray-50/50">
+                
+                <!-- Mensaje de Bienvenida del Agente -->
+                <div class="flex items-start space-x-3 max-w-lg">
+                    <div class="w-8 h-8 rounded-full bg-primary-600 flex-shrink-0 flex items-center justify-center text-white text-xs font-bold">AV</div>
+                    <div class="bg-white border border-gray-100 rounded-2xl rounded-tl-none p-3.5 shadow-sm">
+                        <p class="text-sm text-gray-800">¡Hola! Soy tu agente inteligente de soporte de AVFenix. ¿En qué puedo ayudarte hoy?</p>
+                        <p class="text-[10px] text-gray-400 mt-1.5 font-semibold uppercase">Sistema RAG listo</p>
+                    </div>
+                </div>
+                
+            </div>
+
+            <!-- Área de entrada -->
+            <div class="p-4 border-t border-gray-100 bg-white">
+                <form id="chat-form" class="flex items-center space-x-2">
+                    <input id="chat-input" type="text" placeholder="Escribe tu pregunta sobre la base de conocimientos..." class="flex-1 border border-gray-200 focus:border-primary-500 focus:ring-2 focus:ring-primary-100 rounded-xl px-4 py-3 text-sm focus:outline-none transition">
+                    
+                    <!-- Botón de Micrófono (STT integrado) -->
+                    <button id="mic-btn" type="button" class="p-3 bg-gray-100 hover:bg-gray-200 rounded-xl text-gray-600 transition flex items-center justify-center" title="Preguntar por Voz (Dictar)">
+                        <svg id="mic-icon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path>
+                        </svg>
+                    </button>
+                    
+                    <!-- Botón de Enviar -->
+                    <button type="submit" class="p-3 bg-primary-600 hover:bg-primary-700 text-white rounded-xl shadow-md shadow-primary-500/10 transition flex items-center justify-center">
+                        <svg class="w-5 h-5 transform rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
+                        </svg>
+                    </button>
+                </form>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="bg-gray-100 border-t border-gray-200 py-3 text-center text-xs text-gray-500">
+        AVFenix Zero-Hallucination Agent Console &copy; 2026. Basado en Python RAG, Flask y OpenRouter.
+    </footer>
+
+    <!-- LÓGICA DE CONTROL (JAVASCRIPT) -->
+    <script>
+        // Elementos del DOM
+        const apiUrlInput = document.getElementById('api-url');
+        const connIndicator = document.getElementById('conn-indicator');
+        const connText = document.getElementById('conn-text');
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('file-input');
+        const documentList = document.getElementById('document-list');
+        const emptyDocs = document.getElementById('empty-docs');
+        const docCount = document.getElementById('doc-count');
+        
+        const chatForm = document.getElementById('chat-form');
+        const chatInput = document.getElementById('chat-input');
+        const chatBox = document.getElementById('chat-box');
+        const chatMode = document.getElementById('chat-mode');
+        const micBtn = document.getElementById('mic-btn');
+        const micIcon = document.getElementById('mic-icon');
+        
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const progressPercent = document.getElementById('progress-percent');
+        const uploadFeedback = document.getElementById('upload-feedback');
+
+        let isRecording = false;
+        let recognition = null;
+
+        // Comprobación de salud continua
+        async function checkConnection() {
+            const apiBase = apiUrlInput.value.trim();
+            try {
+                const res = await fetch(`${apiBase}/api/health`, { method: 'GET', timeout: 2000 });
+                if (res.ok) {
+                    connIndicator.className = "w-3.5 h-3.5 rounded-full bg-green-500 shadow-lg shadow-green-500/30";
+                    connText.innerText = "Conectado";
+                    connText.className = "text-xs font-semibold text-green-400";
+                    loadDocuments(); // Carga de forma proactiva la lista de documentos
+                } else {
+                    setDisconnected();
+                }
+            } catch (err) {
+                setDisconnected();
+            }
+        }
+
+        function setDisconnected() {
+            connIndicator.className = "w-3.5 h-3.5 rounded-full bg-red-500 animate-pulse";
+            connText.innerText = "Desconectado";
+            connText.className = "text-xs font-semibold text-gray-400";
+            documentList.innerHTML = `<div id="empty-docs" class="text-center py-10">
+                <p class="text-xs font-medium text-red-400">No hay conexión con la API de Flask.</p>
+            </div>`;
+            docCount.innerText = "0";
+        }
+
+        // Cargar lista de documentos indexados
+        async function loadDocuments() {
+            const apiBase = apiUrlInput.value.trim();
+            try {
+                const res = await fetch(`${apiBase}/api/documents`);
+                if (res.ok) {
+                    const data = await res.json();
+                    const docs = data.documents || [];
+                    docCount.innerText = docs.length;
+
+                    if (docs.length === 0) {
+                        documentList.innerHTML = `
+                            <div id="empty-docs" class="text-center py-10">
+                                <svg class="w-10 h-10 text-gray-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path>
+                                </svg>
+                                <p class="text-xs font-medium text-gray-400">Ningún documento cargado en el agente.</p>
+                            </div>`;
+                        return;
+                    }
+
+                    documentList.innerHTML = '';
+                    docs.forEach(doc => {
+                        const div = document.createElement('div');
+                        div.className = "flex items-center justify-between p-3 bg-gray-50 border border-gray-100 rounded-lg hover:bg-gray-100 transition";
+                        div.innerHTML = `
+                            <div class="flex items-center space-x-2.5 overflow-hidden">
+                                <svg class="w-5 h-5 text-gray-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                                    <path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A1 1 0 0112 2.586L15.414 6A1 1 0 0116 6.586V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"></path>
+                                </svg>
+                                <span class="text-xs font-semibold text-gray-700 truncate" title="${doc}">${doc}</span>
+                            </div>
+                            <button onclick="deleteDocument('${doc}')" class="p-1.5 hover:bg-red-50 text-gray-400 hover:text-red-500 rounded transition" title="Eliminar documento del agente">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                                </svg>
+                            </button>
+                        `;
+                        documentList.appendChild(div);
+                    });
+
+                }
+            } catch (err) {
+                console.error("Error cargando documentos:", err);
+            }
+        }
+
+        // Eliminar Documento
+        async function deleteDocument(filename) {
+            if(!confirm(`¿Seguro que deseas eliminar la base de conocimiento "${filename}"? El agente ya no podrá responder consultas de este documento.`)) return;
+            
+            const apiBase = apiUrlInput.value.trim();
+            try {
+                const res = await fetch(`${apiBase}/api/delete/${encodeURIComponent(filename)}`, {
+                    method: 'DELETE'
+                });
+                if (res.ok) {
+                    loadDocuments();
+                    showNotification(`Se eliminó "${filename}" con éxito.`, 'success');
+                } else {
+                    showNotification("No se pudo eliminar el documento.", "error");
+                }
+            } catch (err) {
+                showNotification("Error de red al intentar eliminar.", "error");
+            }
+        }
+
+        // Subir Archivo
+        async function uploadFile(file) {
+            const apiBase = apiUrlInput.value.trim();
+            const formData = new FormData();
+            formData.append('file', file);
+
+            // Mostrar UI de progreso
+            progressContainer.classList.remove('hidden');
+            uploadFeedback.classList.add('hidden');
+            progressBar.style.width = '20%';
+            progressPercent.innerText = '20%';
+
+            try {
+                progressBar.style.width = '50%';
+                progressPercent.innerText = '50%';
+
+                const res = await fetch(`${apiBase}/api/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                progressBar.style.width = '100%';
+                progressPercent.innerText = '100%';
+
+                if (res.ok) {
+                    const data = await res.json();
+                    showNotification(`¡Éxito! "${data.filename}" ha sido indexado con ${data.chunks_count} fragmentos semánticos.`, 'success');
+                    loadDocuments();
+                } else {
+                    const errData = await res.json();
+                    showNotification(errData.error || "Error al indexar el documento.", 'error');
+                }
+            } catch (err) {
+                showNotification("No hay comunicación con el servidor de Flask.", 'error');
+            } finally {
+                setTimeout(() => {
+                    progressContainer.classList.add('hidden');
+                    progressBar.style.width = '0%';
+                }, 4000);
+            }
+        }
+
+        function showNotification(msg, type) {
+            uploadFeedback.innerText = msg;
+            uploadFeedback.classList.remove('hidden', 'bg-red-50', 'text-red-700', 'bg-green-50', 'text-green-700');
+            if (type === 'success') {
+                uploadFeedback.classList.add('bg-green-50', 'text-green-700');
+            } else {
+                uploadFeedback.classList.add('bg-red-50', 'text-red-700');
+            }
+        }
+
+        // Manejadores del Drag and Drop
+        dropzone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) uploadFile(e.target.files[0]);
+        });
+        dropzone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropzone.classList.add('border-primary-500', 'bg-primary-50');
+        });
+        dropzone.addEventListener('dragleave', () => {
+            dropzone.classList.remove('border-primary-500', 'bg-primary-50');
+        });
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('border-primary-500', 'bg-primary-50');
+            if (e.dataTransfer.files.length > 0) uploadFile(e.dataTransfer.files[0]);
+        });
+
+        // --- MANEJO DEL CHAT ---
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const text = chatInput.value.trim();
+            if (!text) return;
+
+            appendMessage('user', text);
+            chatInput.value = '';
+
+            // Mostrar spinner de cargando para el bot
+            const botMsgId = appendMessage('assistant', `
+                <div class="flex items-center space-x-2 py-1">
+                    <span class="w-2 h-2 rounded-full bg-primary-600 animate-bounce"></span>
+                    <span class="w-2 h-2 rounded-full bg-primary-600 animate-bounce [animation-delay:0.2s]"></span>
+                    <span class="w-2 h-2 rounded-full bg-primary-600 animate-bounce [animation-delay:0.4s]"></span>
+                </div>
+            `, true);
+
+            const apiBase = apiUrlInput.value.trim();
+            try {
+                const res = await fetch(`${apiBase}/api/chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: text,
+                        output_mode: chatMode.value
+                    })
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    
+                    // Reemplazar spinner con respuesta real
+                    updateBotMessage(botMsgId, data.response, data.sources || [], data.audio_url);
+                } else {
+                    const errData = await res.json();
+                    updateBotMessage(botMsgId, `Error en el servidor: ${errData.error || 'Respuesta fallida'}`);
+                }
+            } catch (err) {
+                updateBotMessage(botMsgId, `Error de conexión: Asegúrate de que el backend Flask esté en línea en ${apiBase}`);
+            }
+        });
+
+        // Generar UI de Mensajes en el Chat
+        function appendMessage(role, text, isRawHtml = false) {
+            const msgId = 'msg-' + Date.now() + Math.random().toString(36).substr(2, 4);
+            const div = document.createElement('div');
+            
+            if (role === 'user') {
+                div.className = "flex items-start justify-end space-x-3";
+                div.innerHTML = `
+                    <div class="bg-primary-600 text-white rounded-2xl rounded-tr-none p-3.5 shadow-sm max-w-lg">
+                        <p class="text-sm">${text}</p>
+                    </div>
+                    <div class="w-8 h-8 rounded-full bg-primary-800 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">Tú</div>
+                `;
+            } else {
+                div.className = "flex items-start space-x-3 max-w-xl";
+                div.innerHTML = `
+                    <div class="w-8 h-8 rounded-full bg-primary-600 flex-shrink-0 flex items-center justify-center text-white text-xs font-bold">AV</div>
+                    <div class="bg-white border border-gray-100 rounded-2xl rounded-tl-none p-3.5 shadow-sm flex-1" id="${msgId}-body">
+                        <div class="text-sm text-gray-800">${isRawHtml ? text : formatText(text)}</div>
+                    </div>
+                `;
+            }
+
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            return msgId;
+        }
+
+        // Reemplazar la burbuja de carga del Bot con la información final
+        function updateBotMessage(msgId, text, sources = [], audioUrl = null) {
+            const bodyDiv = document.getElementById(`${msgId}-body`);
+            if (!bodyDiv) return;
+
+            let htmlContent = `<p class="text-sm text-gray-800">${formatText(text)}</p>`;
+
+            // Agregar audios si se devolvió url
+            if (audioUrl) {
+                const fullAudio = `${apiUrlInput.value.trim()}${audioUrl}`;
+                htmlContent += `
+                    <div class="mt-3 bg-gray-50 p-2 rounded-lg border border-gray-100 flex items-center justify-between">
+                        <span class="text-xs text-gray-500 font-semibold uppercase tracking-wide">Voz Generada (TTS)</span>
+                        <audio controls class="h-8 max-w-[200px]" src="${fullAudio}"></audio>
+                    </div>
+                `;
+            }
+
+            // Agregar Fuentes y Citas RAG
+            if (sources.length > 0) {
+                let sourceItems = '';
+                sources.forEach(src => {
+                    sourceItems += `
+                        <div class="p-2 bg-gray-50 rounded border border-gray-100 text-xs">
+                            <div class="flex justify-between font-bold text-gray-700 mb-0.5">
+                                <span class="truncate max-w-[250px]">📄 ${src.filename}</span>
+                                <span class="text-[10px] text-primary-600">Relevancia: ${src.score}</span>
+                            </div>
+                            <div class="text-[10px] text-gray-500">Sección / Pág: ${src.page_number}</div>
+                            <p class="text-[10px] text-gray-400 italic mt-1 line-clamp-2">"${src.text}"</p>
+                        </div>
+                    `;
+                });
+
+                htmlContent += `
+                    <div class="mt-4 border-t border-gray-100 pt-3">
+                        <details class="group">
+                            <summary class="list-none flex items-center justify-between text-xs text-primary-600 font-semibold cursor-pointer select-none">
+                                <span>🔍 Fuentes RAG utilizadas (${sources.length})</span>
+                                <svg class="w-4 h-4 transform group-open:rotate-180 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                                </svg>
+                            </summary>
+                            <div class="mt-2.5 space-y-2 max-h-[160px] overflow-y-auto pr-1">
+                                ${sourceItems}
+                            </div>
+                        </details>
+                    </div>
+                `;
+            }
+
+            bodyDiv.innerHTML = htmlContent;
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        // Formateador de texto básico (negritas y saltos de línea)
+        function formatText(text) {
+            return text
+                .replace(/\n/g, '<br>')
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+        }
+
+        // --- SISTEMA DE DICTADO POR VOZ (STT) ---
+        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            recognition.lang = 'es-ES';
+            recognition.interimResults = false;
+
+            recognition.onstart = () => {
+                isRecording = true;
+                micBtn.classList.replace('bg-gray-100', 'bg-red-500');
+                micBtn.classList.replace('text-gray-600', 'text-white');
+                micIcon.classList.add('animate-pulse');
+                chatInput.placeholder = "Escuchando... Habla ahora.";
+            };
+
+            recognition.onend = () => {
+                isRecording = false;
+                micBtn.classList.replace('bg-red-500', 'bg-gray-100');
+                micBtn.classList.replace('text-white', 'text-gray-600');
+                micIcon.classList.remove('animate-pulse');
+                chatInput.placeholder = "Escribe tu pregunta sobre la base de conocimientos...";
+            };
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                chatInput.value = transcript;
+            };
+
+            recognition.onerror = (e) => {
+                console.error("Error en reconocimiento de voz:", e);
+                recognition.stop();
+            };
+
+            micBtn.addEventListener('click', () => {
+                if (isRecording) {
+                    recognition.stop();
+                } else {
+                    recognition.start();
+                }
+            });
+        } else {
+            micBtn.classList.add('opacity-40', 'cursor-not-allowed');
+            micBtn.title = "Reconocimiento de voz no soportado en este navegador.";
+            micBtn.disabled = true;
+        }
+
+        // Inicializar comprobación de API
+        checkConnection();
+        // Verificar conexión cada 10 segundos de forma pasiva
+        setInterval(checkConnection, 10000);
+    </script>
+</body>
+</html>

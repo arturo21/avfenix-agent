@@ -1,0 +1,6 @@
+flask
+pypdf
+python-docx
+numpy
+scikit-learn
+requests

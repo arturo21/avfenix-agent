@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Widget AVFenix Agent</title>
+    <style>
+        :root {
+            --primary-color: #4f46e5;
+            --primary-hover: #4338ca;
+            --bg-color: #f9fafb;
+            --card-bg: #ffffff;
+            --text-color: #1f2937;
+            --text-muted: #6b7280;
+            --border-color: #e5e7eb;
+            --success-color: #10b981;
+            --danger-color: #ef4444;
+        }
+
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f3f4f6;
+            margin: 0;
+            padding: 0;
+        }
+
+        /* Contenedor de demostración en página principal */
+        .demo-container {
+            max-width: 800px;
+            margin: 80px auto;
+            padding: 40px;
+            background: var(--card-bg);
+            border-radius: 16px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+            text-align: center;
+        }
+
+        .demo-container h1 {
+            color: var(--primary-color);
+            margin-bottom: 12px;
+        }
+
+        .demo-container p {
+            color: var(--text-muted);
+            line-height: 1.6;
+            font-size: 1.1rem;
+        }
+
+        .btn-tutorial {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 24px;
+            background-color: var(--primary-color);
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+
+        .btn-tutorial:hover {
+            background-color: var(--primary-hover);
+        }
+
+        /* --- CÓDIGO DEL WIDGET FLOTANTE --- */
+        #avfenix-widget-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 999999;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+
+        /* Botón Flotante para abrir/cerrar */
+        #avfenix-launcher {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary-color), #6366f1);
+            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), background 0.3s;
+        }
+
+        #avfenix-launcher:hover {
+            transform: scale(1.08);
+        }
+
+        #avfenix-launcher svg {
+            width: 28px;
+            height: 28px;
+            fill: white;
+            transition: transform 0.3s ease;
+        }
+
+        #avfenix-launcher.active svg {
+            transform: rotate(90deg);
+        }
+
+        /* Ventana del Chat */
+        #avfenix-chatbox {
+            width: 380px;
+            height: 580px;
+            background-color: var(--card-bg);
+            border-radius: 16px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.15);
+            display: none;
+            flex-direction: column;
+            overflow: hidden;
+            margin-bottom: 16px;
+            border: 1px solid var(--border-color);
+            transition: all 0.3s ease;
+        }
+
+        @media (max-width: 480px) {
+            #avfenix-chatbox {
+                width: calc(100vw - 32px);
+                height: calc(100vh - 120px);
+                bottom: 80px;
+                right: 16px;
+            }
+        }
+
+        /* Cabecera */
+        .chat-header {
+            background: linear-gradient(135deg, var(--primary-color), #6366f1);
+            color: white;
+            padding: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .agent-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .agent-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background-color: rgba(255, 255, 255, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.2rem;
+            border: 2px solid rgba(255, 255, 255, 0.4);
+        }
+
+        .agent-details h3 {
+            margin: 0;
+            font-size: 1rem;
+            font-weight: 600;
+        }
+
+        .agent-status {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 0.75rem;
+            opacity: 0.9;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--success-color);
+            display: inline-block;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: white;
+            opacity: 0.8;
+            transition: opacity 0.2s;
+            padding: 4px;
+        }
+
+        .header-btn:hover {
+            opacity: 1;
+        }
+
+        /* Cuerpo del Chat / Mensajes */
+        .chat-body {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            background-color: var(--bg-color);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        /* Estilo de Mensajes */
+        .message {
+            max-width: 80%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            font-size: 0.92rem;
+            line-height: 1.45;
+            word-wrap: break-word;
+        }
+
+        .message.bot {
+            background-color: white;
+            color: var(--text-color);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+            border: 1px solid var(--border-color);
+        }
+
+        .message.user {
+            background-color: var(--primary-color);
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+            box-shadow: 0 2px 6px rgba(79, 70, 229, 0.2);
+        }
+
+        /* Fuentes / Referencias */
+        .message-sources {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px dashed var(--border-color);
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .source-tag {
+            background-color: #f3f4f6;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #e5e7eb;
+            cursor: help;
+        }
+
+        /* Panel de Administración */
+        .admin-panel {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            background-color: white;
+            display: none;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .admin-panel h4 {
+            margin: 0 0 8px 0;
+            color: var(--text-color);
+            font-size: 1rem;
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 4px;
+        }
+
+        /* Drag and Drop Zone */
+        .upload-zone {
+            border: 2px dashed var(--border-color);
+            border-radius: 8px;
+            padding: 24px;
+            text-align: center;
+            cursor: pointer;
+            background-color: var(--bg-color);
+            transition: border-color 0.2s, background-color 0.2s;
+        }
+
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: var(--primary-color);
+            background-color: #f0f0ff;
+        }
+
+        .upload-zone svg {
+            width: 36px;
+            height: 36px;
+            fill: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .upload-zone p {
+            margin: 0;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .upload-zone span {
+            display: block;
+            margin-top: 4px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            opacity: 0.8;
+        }
+
+        /* Lista de Documentos */
+        .doc-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .doc-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            background-color: var(--bg-color);
+            border-radius: 6px;
+            font-size: 0.82rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .doc-name {
+            font-weight: 500;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 220px;
+            color: var(--text-color);
+        }
+
+        .btn-delete {
+            background: none;
+            border: none;
+            color: var(--danger-color);
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        .btn-delete:hover {
+            background-color: #fee2e2;
+        }
+
+        /* Barra de Entrada de Chat */
+        .chat-input-container {
+            padding: 12px;
+            background-color: white;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .chat-input-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .chat-input {
+            flex: 1;
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 10px 16px;
+            font-size: 0.9rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .chat-input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .input-btn {
+            background-color: #f3f4f6;
+            border: none;
+            border-radius: 50%;
+            width: 38px;
+            height: 38px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            color: var(--text-muted);
+            transition: all 0.2s;
+        }
+
+        .input-btn:hover {
+            background-color: #e5e7eb;
+            color: var(--text-color);
+        }
+
+        .input-btn.active {
+            background-color: var(--danger-color);
+            color: white;
+            animation: pulse 1.5s infinite;
+        }
+
+        .btn-send {
+            background-color: var(--primary-color);
+            color: white;
+        }
+
+        .btn-send:hover {
+            background-color: var(--primary-hover);
+        }
+
+        /* Controles Adicionales */
+        .chat-options {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            padding: 0 4px;
+        }
+
+        .audio-toggle {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); box-shadow: 0 0 10px rgba(239, 68, 68, 0.5); }
+            100% { transform: scale(1); }
+        }
+
+        /* Animación de carga de escritura */
+        .typing-indicator {
+            display: flex;
+            gap: 4px;
+            padding: 8px 12px;
+            align-self: flex-start;
+            background-color: white;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            width: fit-content;
+        }
+
+        .typing-dot {
+            width: 6px;
+            height: 6px;
+            background-color: var(--text-muted);
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1.0); }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="demo-container">
+        <h1>Soporte Inteligente AVFenix</h1>
+        <p>Este es el entorno web del agente. Puedes integrar este widget interactivo de soporte con RAG integrado copiando el script y la estructura HTML en cualquiera de tus páginas web corporativas.</p>
+        <p><strong>Fase 1 completada:</strong> Cerebro de IA configurado con búsqueda vectorial y prevención de alucinaciones en tiempo real.</p>
+        <p>Haz clic en el widget de chat azul que se encuentra en la esquina inferior derecha para probarlo.</p>
+        <a href="#avfenix-launcher" class="btn-tutorial" onclick="toggleChat(event)">Abrir Widget de Soporte</a>
+    </div>
+
+    <!-- --- ESTRUCTURA DEL WIDGET FLOTANTE --- -->
+    <div id="avfenix-widget-container">
+        
+        <!-- Ventana del Chatbox -->
+        <div id="avfenix-chatbox">
+            
+            <!-- Cabecera -->
+            <div class="chat-header">
+                <div class="agent-info">
+                    <div class="agent-avatar">AV</div>
+                    <div class="agent-details">
+                        <h3>Asesor AVFenix</h3>
+                        <div class="agent-status">
+                            <span class="status-dot"></span>
+                            <span>En línea (Con RAG)</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <!-- Botón para alternar modo administrador -->
+                    <button class="header-btn" id="btn-admin" title="Administrar Base de Conocimientos">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Cuerpo del Chat Principal (Mensajes) -->
+            <div class="chat-body" id="chat-messages">
+                <div class="message bot">
+                    ¡Hola! Soy tu asistente de soporte AVFenix. ¿En qué puedo asesorarte hoy?
+                    <br><small style="opacity: 0.8; font-size: 0.75rem; margin-top: 4px; display: block;">Nota: Responderé ciñéndome únicamente a los documentos cargados en mi base de conocimiento para evitar cualquier alucinación.</small>
+                </div>
+            </div>
+
+            <!-- Panel de Administración Oculto (Manejo de Base de Conocimientos) -->
+            <div class="admin-panel" id="admin-panel">
+                <h4>Base de Conocimiento</h4>
+                <div class="upload-zone" id="drop-zone">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    <p>Arrastra aquí tus archivos PDF o DOCX</p>
+                    <span>O haz clic para explorar tu equipo</span>
+                    <input type="file" id="file-input" accept=".pdf,.docx,.doc" style="display: none;">
+                </div>
+
+                <h4>Documentos Indexados</h4>
+                <div style="flex: 1; overflow-y: auto;">
+                    <ul class="doc-list" id="document-list">
+                        <!-- Cargados dinámicamente -->
+                        <li style="color: var(--text-muted); font-size: 0.8rem; text-align: center; margin-top: 12px;">Cargando lista de documentos...</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Barra de Entrada y Botones -->
+            <div class="chat-input-container">
+                <div class="chat-input-row">
+                    <input type="text" class="chat-input" id="chat-input-text" placeholder="Escribe tu consulta aquí..." autocomplete="off">
+                    
+                    <!-- Botón de Grabación de Voz (Web Speech API) -->
+                    <button class="input-btn" id="btn-voice" title="Hablar con el Asistente">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="23"></line>
+                            <line x1="8" y1="23" x2="16" y2="23"></line>
+                        </svg>
+                    </button>
+                    
+                    <!-- Botón de Enviar -->
+                    <button class="input-btn btn-send" id="btn-send-chat" title="Enviar Mensaje">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="margin-left: 2px;">
+                            <line x1="22" y1="2" x2="11" y2="13"></line>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                    </button>
+                </div>
+                
+                <div class="chat-options">
+                    <label class="audio-toggle">
+                        <input type="checkbox" id="chk-audio">
+                        <span>Habilitar respuestas por voz</span>
+                    </label>
+                    <span id="connection-status" style="font-size: 0.75rem; color: var(--text-muted)">• Conectando al backend...</span>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Botón Lanzador Flotante -->
+        <div id="avfenix-launcher" title="Chatear con soporte">
+            <svg id="launcher-icon-open" viewBox="0 0 24 24">
+                <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12z"/>
+            </svg>
+        </div>
+
+    </div>
+
+    <!-- --- LOGICA DE INTEGRACION CON BACKEND --- -->
+    <script>
+        const BACKEND_URL = "http://localhost:5000"; // URL del servidor Flask de la Fase 1
+        
+        const launcher = document.getElementById('avfenix-launcher');
+        const chatbox = document.getElementById('avfenix-chatbox');
+        const btnAdmin = document.getElementById('btn-admin');
+        const chatMessages = document.getElementById('chat-messages');
+        const adminPanel = document.getElementById('admin-panel');
+        const chatInput = document.getElementById('chat-input-text');
+        const btnSend = document.getElementById('btn-send-chat');
+        const btnVoice = document.getElementById('btn-voice');
+        const chkAudio = document.getElementById('chk-audio');
+        const docList = document.getElementById('document-list');
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const connStatus = document.getElementById('connection-status');
+
+        let showAdmin = false;
+        let isRecording = false;
+        let recognition = null;
+
+        // Abrir y cerrar el chat flotante
+        launcher.addEventListener('click', () => {
+            const isOpen = chatbox.style.display === 'flex';
+            chatbox.style.display = isOpen ? 'none' : 'flex';
+            launcher.classList.toggle('active', !isOpen);
+            if (!isOpen) {
+                chatInput.focus();
+                checkBackendHealth();
+                loadIndexedDocuments();
+            }
+        });
+
+        function toggleChat(e) {
+            e.preventDefault();
+            chatbox.style.display = 'flex';
+            launcher.classList.add('active');
+            chatInput.focus();
+            checkBackendHealth();
+            loadIndexedDocuments();
+        }
+
+        // Alternar vista de chat y administrador
+        btnAdmin.addEventListener('click', () => {
+            showAdmin = !showAdmin;
+            if (showAdmin) {
+                adminPanel.style.display = 'flex';
+                chatMessages.style.display = 'none';
+                btnAdmin.style.color = 'var(--primary-color)';
+                btnAdmin.style.backgroundColor = '#f3f4f6';
+                btnAdmin.style.borderRadius = '50%';
+                loadIndexedDocuments();
+            } else {
+                adminPanel.style.display = 'none';
+                chatMessages.style.display = 'flex';
+                btnAdmin.style.color = 'white';
+                btnAdmin.style.background = 'none';
+            }
+        });
+
+        // Comprobar estado del backend
+        async function checkBackendHealth() {
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/health`);
+                if (res.ok) {
+                    connStatus.textContent = "• Conectado";
+                    connStatus.style.color = "var(--success-color)";
+                } else {
+                    connStatus.textContent = "• Error de servidor";
+                    connStatus.style.color = "var(--danger-color)";
+                }
+            } catch (err) {
+                connStatus.textContent = "• Backend Desconectado";
+                connStatus.style.color = "var(--danger-color)";
+            }
+        }
+
+        // Cargar lista de documentos indexados
+        async function loadIndexedDocuments() {
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/documents`);
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+                
+                docList.innerHTML = '';
+                if (data.documents.length === 0) {
+                    docList.innerHTML = '<li style="color: var(--text-muted); font-size: 0.8rem; text-align: center; margin-top: 12px;">No hay documentos indexados. Sube un PDF/DOCX arriba.</li>';
+                    return;
+                }
+
+                data.documents.forEach(doc => {
+                    const li = document.createElement('li');
+                    li.className = 'doc-item';
+                    li.innerHTML = `
+                        <span class="doc-name" title="${doc}">${doc}</span>
+                        <button class="btn-delete" onclick="deleteDocument('${doc}')" title="Eliminar documento">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="3 6 5 6 21 6"></polyline>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                            </svg>
+                        </button>
+                    `;
+                    docList.appendChild(li);
+                });
+            } catch (err) {
+                docList.innerHTML = '<li style="color: var(--danger-color); font-size: 0.8rem; text-align: center; margin-top: 12px;">Error al cargar documentos.</li>';
+            }
+        }
+
+        // Eliminar documento
+        window.deleteDocument = async function(filename) {
+            if (!confirm(`¿Estás seguro de que quieres eliminar el documento "${filename}"? El agente ya no sabrá responder basándose en él.`)) {
+                return;
+            }
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/delete/${encodeURIComponent(filename)}`, {
+                    method: 'DELETE'
+                });
+                if (res.ok) {
+                    loadIndexedDocuments();
+                } else {
+                    alert("Error al eliminar el documento.");
+                }
+            } catch (err) {
+                alert("Error de red.");
+            }
+        };
+
+        // Manejo de carga de archivos (Drag & Drop y Click)
+        dropZone.addEventListener('click', () => fileInput.click());
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                uploadFile(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                uploadFile(fileInput.files[0]);
+            }
+        });
+
+        async function uploadFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            dropZone.querySelector('p').textContent = `Subiendo ${file.name}...`;
+            
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await res.json();
+                
+                if (res.ok) {
+                    alert(`Éxito: ${data.message}`);
+                    loadIndexedDocuments();
+                } else {
+                    alert(`Error: ${data.error}`);
+                }
+            } catch (err) {
+                alert("Error de conexión al subir el archivo.");
+            } finally {
+                dropZone.querySelector('p').textContent = "Arrastra aquí tus archivos PDF o DOCX";
+                fileInput.value = '';
+            }
+        }
+
+        // Enviar Mensaje de Chat al Backend
+        async function sendMessage() {
+            const text = chatInput.value.trim();
+            if (!text) return;
+
+            // Renderizar mensaje del usuario
+            appendMessage(text, 'user');
+            chatInput.value = '';
+
+            // Renderizar indicador de escritura
+            const typingIndicator = showTypingIndicator();
+
+            const mode = chkAudio.checked ? "both" : "text";
+
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text, output_mode: mode })
+                });
+                
+                typingIndicator.remove();
+
+                if (!res.ok) {
+                    const errData = await res.json();
+                    appendMessage(`Error: ${errData.error || "Ocurrió un error en el servidor."}`, 'bot');
+                    return;
+                }
+
+                const data = await res.json();
+                appendMessage(data.response, 'bot', data.sources);
+
+                // Si se solicitó audio y se retornó una ruta de TTS, podemos reproducirlo.
+                // En un entorno local, el frontend también puede usar el SpeechSynthesis de forma gratuita:
+                if (chkAudio.checked && data.response) {
+                    speakText(data.response);
+                }
+
+            } catch (err) {
+                typingIndicator.remove();
+                appendMessage("Lo siento, tengo problemas para conectarme al backend. Asegúrate de tener el servidor Flask corriendo localmente.", 'bot');
+            }
+        }
+
+        btnSend.addEventListener('click', sendMessage);
+        chatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        // Crear burbuja de mensaje en la UI
+        function appendMessage(text, sender, sources = []) {
+            const div = document.createElement('div');
+            div.className = `message ${sender}`;
+            
+            // Reemplazar saltos de línea para renderizar bonito
+            div.innerHTML = text.replace(/\n/g, '<br>');
+
+            // Añadir fuentes si es un bot y contiene datos de origen
+            if (sender === 'bot' && sources && sources.length > 0) {
+                const srcContainer = document.createElement('div');
+                srcContainer.className = 'message-sources';
+                srcContainer.innerHTML = '<strong>Fuentes:</strong> ';
+                
+                // Agrupamos fuentes para no repetir nombres de archivos
+                const uniqueSources = {};
+                sources.forEach(src => {
+                    const label = `${src.filename} (Pág. ${src.page_number})`;
+                    uniqueSources[label] = Math.max(uniqueSources[label] || 0, src.score);
+                });
+
+                Object.keys(uniqueSources).forEach(label => {
+                    const span = document.createElement('span');
+                    span.className = 'source-tag';
+                    span.textContent = label;
+                    span.title = `Similitud semántica: ${uniqueSources[label]}`;
+                    srcContainer.appendChild(span);
+                });
+                
+                div.appendChild(srcContainer);
+            }
+
+            chatMessages.appendChild(div);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        // Mostrar indicador de carga
+        function showTypingIndicator() {
+            const div = document.createElement('div');
+            div.className = 'typing-indicator';
+            div.innerHTML = '<div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>';
+            chatMessages.appendChild(div);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            return div;
+        }
+
+        // --- RECONOCIMIENTO DE VOZ INTEGRADO (Web Speech API) ---
+        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            recognition = new SpeechRecognition();
+            recognition.lang = 'es-ES';
+            recognition.continuous = false;
+            recognition.interimResults = false;
+
+            recognition.onstart = () => {
+                isRecording = true;
+                btnVoice.classList.add('active');
+                chatInput.placeholder = "Escuchando...";
+            };
+
+            recognition.onend = () => {
+                isRecording = false;
+                btnVoice.classList.remove('active');
+                chatInput.placeholder = "Escribe tu consulta aquí...";
+            };
+
+            recognition.onresult = (e) => {
+                const speechToText = e.results[0][0].transcript;
+                chatInput.value = speechToText;
+                sendMessage(); // Envía el mensaje automáticamente después de transcribir
+            };
+
+            recognition.onerror = () => {
+                isRecording = false;
+                btnVoice.classList.remove('active');
+                chatInput.placeholder = "Escribe tu consulta aquí...";
+            };
+
+            btnVoice.addEventListener('click', () => {
+                if (isRecording) {
+                    recognition.stop();
+                } else {
+                    recognition.start();
+                }
+            });
+        } else {
+            btnVoice.style.display = 'none'; // Se oculta el botón si el navegador no soporta voz-a-texto
+            console.log("Web Speech API no soportada en este navegador.");
+        }
+
+        // --- SÍNTESIS DE VOZ GRATUITA (Navegador Fallback) ---
+        function speakText(text) {
+            if ('speechSynthesis' in window) {
+                // Cancelar audios anteriores activos
+                window.speechSynthesis.cancel();
+                
+                // Quitamos las etiquetas HTML o fuentes de la voz
+                let cleanText = text.replace(/<[^>]*>/g, '');
+                // Acortar texto largo para el lector del navegador
+                cleanText = cleanText.split("Fuentes:")[0];
+
+                const utterance = new SpeechSynthesisUtterance(cleanText);
+                utterance.lang = 'es-MX'; // Preferimos voz en español latino/mexicano si está disponible
+                
+                // Buscar voces en español instaladas en el sistema
+                const voices = window.speechSynthesis.getVoices();
+                const esVoice = voices.find(voice => voice.lang.includes('es'));
+                if (esVoice) utterance.voice = esVoice;
+                
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+        
+        // Cargar voces en sistemas que las cargan asíncronamente
+        if ('speechSynthesis' in window) {
+            window.speechSynthesis.onvoiceschanged = () => {};
+        }
+
+        // Ejecutar primer estado
+        checkBackendHealth();
+    </script>
+</body>
+</html>
