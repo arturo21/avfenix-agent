@@ -4,14 +4,22 @@ import os
 from typing import List, Dict, Any
 import pypdf
 import docx
+import requests
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+# Intentamos importar BeautifulSoup si está disponible
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
 class DocumentProcessor:
     def __init__(self, min_chunk_size: int = 300, max_chunk_size: int = 1500, threshold: float = 0.15):
         """
-        Inicializa el procesador de documentos.
+        Inicializa el procesador de documentos y URLs.
         :param min_chunk_size: Tamaño mínimo en caracteres de un fragmento.
         :param max_chunk_size: Tamaño máximo en caracteres de un fragmento.
         :param threshold: Umbral de similitud coseno TF-IDF para dividir fragmentos semánticamente.
@@ -40,12 +48,10 @@ class DocumentProcessor:
     def extract_text_docx(self, file_path: str) -> List[Dict[str, Any]]:
         """
         Extrae el texto de un archivo Word (.docx).
-        Como Word no tiene páginas físicas fijas de manera estándar, extrae por párrafos.
         """
         doc = docx.Document(file_path)
         paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
         
-        # Agrupamos los párrafos en bloques manejables para simular 'páginas' o secciones
         sections = []
         current_section_text = []
         current_len = 0
@@ -54,7 +60,7 @@ class DocumentProcessor:
         for p in paragraphs:
             current_section_text.append(p)
             current_len += len(p)
-            if current_len >= 2000:  # Cada ~2000 caracteres creamos una sección/página ficticia
+            if current_len >= 2000:
                 sections.append({
                     "text": "\n\n".join(current_section_text),
                     "page_number": section_idx
@@ -71,11 +77,61 @@ class DocumentProcessor:
             
         return sections
 
+    def extract_text_url(self, url: str) -> List[Dict[str, Any]]:
+        """
+        Extrae y limpia el contenido de texto de una página web a partir de su URL.
+        """
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        
+        resp.encoding = resp.apparent_encoding or 'utf-8'
+        html_content = resp.text
+        
+        if BS4_AVAILABLE:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for script in soup(["script", "style", "nav", "footer", "header", "noscript", "svg"]):
+                script.decompose()
+            text = soup.get_text(separator='\n')
+        else:
+            text = re.sub(r'<(script|style|nav|footer|header).*?>.*?</\1>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', '\n', text)
+            
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        clean_text = "\n".join(lines)
+        
+        sections = []
+        paragraphs = clean_text.split("\n")
+        current_section = []
+        current_len = 0
+        section_idx = 1
+        
+        for p in paragraphs:
+            current_section.append(p)
+            current_len += len(p)
+            if current_len >= 2000:
+                sections.append({
+                    "text": "\n".join(current_section),
+                    "page_number": section_idx
+                })
+                current_section = []
+                current_len = 0
+                section_idx += 1
+                
+        if current_section:
+            sections.append({
+                "text": "\n".join(current_section),
+                "page_number": section_idx
+            })
+            
+        return sections
+
     def split_into_sentences(self, text: str) -> List[str]:
         """
         Divide un texto largo en oraciones individuales utilizando expresiones regulares.
         """
-        # Expresión regular que intenta no dividir en abreviaciones comunes (ej. Sr., Dr., pág.)
         sentence_end = re.compile(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s+')
         sentences = sentence_end.split(text)
         return [s.strip() for s in sentences if s.strip()]
@@ -108,19 +164,15 @@ class DocumentProcessor:
                 chunk_global_id += 1
                 continue
 
-            # Vectorización TF-IDF local a nivel de oraciones para este bloque
             try:
-                # Usamos analyzer='char_wb' con n-grams para ser robustos frente a errores tipográficos o textos cortos
                 vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5))
                 tfidf_matrix = vectorizer.fit_transform(sentences)
                 
-                # Calculamos similitud entre oraciones adyacentes
                 similarities = []
                 for i in range(len(sentences) - 1):
                     sim = cosine_similarity(tfidf_matrix[i], tfidf_matrix[i+1])[0][0]
                     similarities.append(sim)
             except Exception:
-                # Fallback si falla la vectorización (por ejemplo, textos extremadamente cortos o vacíos)
                 similarities = [0.0] * (len(sentences) - 1)
 
             current_chunk_sentences = [sentences[0]]
@@ -130,12 +182,7 @@ class DocumentProcessor:
                 next_sentence = sentences[i+1]
                 sim = similarities[i]
                 
-                # Criterio de división:
-                # 1. Si el fragmento actual ya supera el máximo, dividimos obligatoriamente.
-                # 2. Si es menor al mínimo, seguimos agrupando sin importar la similitud.
-                # 3. Si está en el rango medio, dividimos si la similitud cae por debajo del umbral.
                 if current_chunk_len + len(next_sentence) > self.max_chunk_size:
-                    # Guardamos el fragmento actual y empezamos uno nuevo
                     chunks.append({
                         "text": " ".join(current_chunk_sentences),
                         "metadata": {
@@ -149,16 +196,13 @@ class DocumentProcessor:
                     current_chunk_sentences = [next_sentence]
                     current_chunk_len = len(next_sentence)
                 elif current_chunk_len < self.min_chunk_size:
-                    # Agrupamos de forma obligada para no crear micro-fragmentos sin contexto
                     current_chunk_sentences.append(next_sentence)
                     current_chunk_len += len(next_sentence) + 1
                 else:
-                    # Estamos en rango medio: evaluamos la similitud semántica
                     if sim >= self.threshold:
                         current_chunk_sentences.append(next_sentence)
                         current_chunk_len += len(next_sentence) + 1
                     else:
-                        # La similitud es baja: dividimos el tema
                         chunks.append({
                             "text": " ".join(current_chunk_sentences),
                             "metadata": {
@@ -172,7 +216,6 @@ class DocumentProcessor:
                         current_chunk_sentences = [next_sentence]
                         current_chunk_len = len(next_sentence)
 
-            # Agregar el último fragmento restante si tiene contenido
             if current_chunk_sentences:
                 chunks.append({
                     "text": " ".join(current_chunk_sentences),
@@ -201,4 +244,16 @@ class DocumentProcessor:
         else:
             raise ValueError(f"Extensión de archivo no soportada: {ext}")
             
+        return self.semantic_chunking(blocks, filename)
+
+    def process_url(self, url: str) -> List[Dict[str, Any]]:
+        """
+        Scrapea una página web y la convierte en fragmentos semánticamente agrupados.
+        """
+        blocks = self.extract_text_url(url)
+        clean_name = url.replace("https://", "").replace("http://", "").rstrip("/")
+        clean_name = re.sub(r'[^\w\.-]', '_', clean_name)
+        if len(clean_name) > 60:
+            clean_name = clean_name[:60]
+        filename = f"WEB_{clean_name}"
         return self.semantic_chunking(blocks, filename)

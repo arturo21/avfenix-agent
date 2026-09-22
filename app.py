@@ -1,116 +1,375 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import re
+import json
 import requests
-from flask import Flask, request, jsonify, send_from_directory
+from typing import Tuple, List, Dict, Any, Optional
+from flask import Flask, request, jsonify, Response, send_from_directory
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Cargar variables de entorno desde un archivo .env si está presente
+# Evitar advertencias/fallos de CUDA si la versión del driver GPU es antigua
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Cargar variables de entorno desde .env
 load_dotenv()
 
 # Importamos nuestros módulos locales
 from document_processor import DocumentProcessor
 from vector_store import SimpleVectorStore
+from whatsapp_handler import WhatsAppHandler
+from meta_messenger_handler import MetaMessengerHandler
+from database_manager import DatabaseManager
+from tts_engine import TTSEngine
+from video_generator import WhiteboardVideoGenerator
 
 app = Flask(__name__)
 
-# Configuración de carpetas y carga de componentes
+# Configuración de carpetas y componentes
 UPLOAD_FOLDER = os.path.abspath("./uploads")
+AUDIO_FOLDER = os.path.abspath("./uploads/audio")
+VIDEO_FOLDER = os.path.abspath("./uploads/video")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(AUDIO_FOLDER, exist_ok=True)
+os.makedirs(VIDEO_FOLDER, exist_ok=True)
 
-# Guardamos el índice vectorial dentro de la carpeta uploads para mayor orden
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['AUDIO_FOLDER'] = AUDIO_FOLDER
+app.config['VIDEO_FOLDER'] = VIDEO_FOLDER
+
+# Instancias principales
 VECTOR_STORE_PATH = os.path.join(UPLOAD_FOLDER, "vector_index.pkl")
 vector_store = SimpleVectorStore(storage_path=VECTOR_STORE_PATH)
 processor = DocumentProcessor(min_chunk_size=300, max_chunk_size=1200, threshold=0.15)
+whatsapp_handler = WhatsAppHandler()
+meta_messenger_handler = MetaMessengerHandler()
+db_manager = DatabaseManager(db_path=os.path.join(UPLOAD_FOLDER, "conversations.db"))
+tts_engine = TTSEngine(output_folder=AUDIO_FOLDER)
+video_generator = WhiteboardVideoGenerator(output_dir=VIDEO_FOLDER)
 
-# Guardamos en caché el modelo seleccionado para evitar latencias en cada mensaje del chat
-cached_free_model = None
+# Control de duplicados de Webhooks
+processed_message_ids = set()
 
-# Lista de modelos inestables o problemáticos que queremos excluir del carrusel dinámico
+# Caché en memoria para información de proveedor
+cached_provider_info = None
+
 BLACKLIST_MODELS = [
     "inclusionai/ling-3.0-flash-fin:free",
     "undaligned/llama-3-8b-instruct:free",
     "fargolabs/llama-3-8b-instruct-fp16:free"
 ]
 
-def get_available_free_model():
-    """
-    Consulta la API de OpenRouter de manera rápida para detectar qué modelos
-    gratuitos están activos, estables y disponibles.
-    Implementa una lista negra y una caché en memoria para máxima velocidad.
-    """
-    global cached_free_model
-    
-    # Si ya lo consultamos previamente en esta sesión, retornamos el resultado cacheado
-    if cached_free_model:
-        return cached_free_model
+STABLE_FREE_PRIORITY = [
+    "google/gemini-2.5-flash:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-r1:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "meta-llama/llama-3-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "microsoft/phi-3-medium-128k-instruct:free",
+    "anyapi/free-gpt-4o-mini"
+]
 
-    fallback_model = "google/gemini-2.5-flash:free"
-    url = "https://openrouter.ai/api/v1/models"
-    
-    # Lista de modelos gratuitos estables de alta calidad (orden de prioridad)
-    stable_free_priority = [
-        "google/gemini-2.5-flash:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "deepseek/deepseek-r1:free",
-        "qwen/qwen-2.5-7b-instruct:free",
-        "meta-llama/llama-3-8b-instruct:free",
-        "mistralai/mistral-7b-instruct:free",
-        "microsoft/phi-3-medium-128k-instruct:free"
-    ]
+
+def discover_free_models_anyapi(api_key: str, base_url: str) -> list:
+    models_url = f"{base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    free_models = []
     
     try:
-        # Hacemos una consulta rápida con un timeout estricto de 4 segundos para no bloquear la app
-        response = requests.get(url, timeout=4)
+        response = requests.get(models_url, headers=headers, timeout=4)
         if response.status_code == 200:
-            models_data = response.json().get("data", [])
-            free_models = []
-            
-            for model in models_data:
-                model_id = model.get("id", "")
-                
-                # Ignorar modelos en lista negra
-                if model_id in BLACKLIST_MODELS:
+            data = response.json().get("data", [])
+            for item in data:
+                model_id = item.get("id", "")
+                if not model_id or model_id in BLACKLIST_MODELS:
                     continue
-                    
-                pricing = model.get("pricing", {})
                 
-                # Evaluamos los costos del modelo (tanto para prompt como para completion)
+                pricing = item.get("pricing", {})
                 try:
-                    prompt_cost = float(pricing.get("prompt", 1))
-                    completion_cost = float(pricing.get("completion", 1))
+                    p_cost = float(pricing.get("prompt", 1))
+                    c_cost = float(pricing.get("completion", 1))
                 except (ValueError, TypeError):
-                    prompt_cost = 1.0
-                    completion_cost = 1.0
+                    p_cost = 1.0
+                    c_cost = 1.0
                 
-                # Un modelo es considerado gratis si sus costos de API son cero o termina en ':free'
-                if (prompt_cost == 0.0 and completion_cost == 0.0) or model_id.endswith(":free"):
+                if (p_cost == 0.0 and c_cost == 0.0) or model_id.endswith(":free") or model_id.startswith("free-") or "free" in model_id.lower():
                     free_models.append(model_id)
-            
-            if free_models:
-                # 1. Buscamos el primer modelo disponible que coincida con nuestra lista de prioridad estable
-                for preferred in stable_free_priority:
-                    if preferred in free_models:
-                        cached_free_model = preferred
-                        print(f"[*] Modelo gratuito recomendado seleccionado: {cached_free_model}")
-                        return cached_free_model
-                
-                # 2. Si ninguno de los preferidos está libre, tomamos el primero disponible de la lista general
-                cached_free_model = free_models[0]
-                print(f"[*] Modelo gratuito genérico seleccionado: {cached_free_model}")
-                return cached_free_model
-                
     except Exception as e:
-        print(f"[!] Advertencia al consultar modelos en OpenRouter: {e}. Usando fallback por defecto.")
+        print(f"[!] Advertencia al consultar AnyAPI AI models: {e}")
+        
+    return free_models
+
+
+def discover_free_models_openrouter(api_key: str, base_url: str) -> list:
+    models_url = f"{base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    free_models = []
     
-    # En caso de error o de no encontrar modelos libres, usamos el fallback
-    cached_free_model = fallback_model
-    return cached_free_model
+    try:
+        response = requests.get(models_url, headers=headers, timeout=4)
+        if response.status_code == 200:
+            data = response.json().get("data", [])
+            for item in data:
+                model_id = item.get("id", "")
+                if not model_id or model_id in BLACKLIST_MODELS:
+                    continue
+                
+                pricing = item.get("pricing", {})
+                try:
+                    p_cost = float(pricing.get("prompt", 1))
+                    c_cost = float(pricing.get("completion", 1))
+                except (ValueError, TypeError):
+                    p_cost = 1.0
+                    c_cost = 1.0
+                
+                if (p_cost == 0.0 and c_cost == 0.0) or model_id.endswith(":free"):
+                    free_models.append(model_id)
+    except Exception as e:
+        print(f"[!] Advertencia al consultar OpenRouter models: {e}")
+        
+    return free_models
 
 
-# Manejo manual de CORS en Flask (flask_cors no está disponible)
+def resolve_active_provider_and_models():
+    global cached_provider_info
+    if cached_provider_info:
+        return cached_provider_info
+
+    configured_provider = os.environ.get("AI_PROVIDER", "auto").lower().strip()
+    anyapi_key = os.environ.get("ANYAPI_API_KEY", "").strip()
+    anyapi_base = os.environ.get("ANYAPI_BASE_URL", "https://api.anyapi.ai/v1").strip()
+    
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
+
+    active_provider = "none"
+    api_key = ""
+    base_url = ""
+    free_models = []
+
+    if configured_provider == "anyapi" or (configured_provider == "auto" and anyapi_key):
+        active_provider = "anyapi"
+        api_key = anyapi_key
+        base_url = anyapi_base
+        if api_key:
+            free_models = discover_free_models_anyapi(api_key, base_url)
+    
+    if not free_models and (configured_provider == "openrouter" or (configured_provider == "auto" and openrouter_key)):
+        active_provider = "openrouter"
+        api_key = openrouter_key
+        base_url = openrouter_base
+        if api_key:
+            free_models = discover_free_models_openrouter(api_key, base_url)
+
+    ordered_free_models = []
+    if free_models:
+        for pref in STABLE_FREE_PRIORITY:
+            if pref in free_models:
+                ordered_free_models.append(pref)
+        for m in free_models:
+            if m not in ordered_free_models:
+                ordered_free_models.append(m)
+
+    if not ordered_free_models:
+        ordered_free_models = ["google/gemini-2.5-flash:free"]
+
+    cached_provider_info = {
+        "provider": active_provider if active_provider != "none" else ("anyapi" if anyapi_key else ("openrouter" if openrouter_key else "none")),
+        "api_key": api_key or anyapi_key or openrouter_key,
+        "base_url": base_url or (anyapi_base if anyapi_key else openrouter_base),
+        "free_models": ordered_free_models,
+        "active_model": ordered_free_models[0]
+    }
+    return cached_provider_info
+
+
+def parse_suggestions_and_clean_text(response_text: str):
+    if not response_text or not isinstance(response_text, str):
+        return "Respuesta no disponible.", [
+            "¿Deseas profundizar más en este tema?",
+            "¿Qué requisitos o pasos adicionales necesitas?",
+            "¿Quieres consultar otro documento de la base?"
+        ]
+
+    suggestions = []
+    clean_text = response_text
+    
+    match = re.search(r'\[SUGERENCIAS\]:\s*(\[.*?\])', response_text, re.DOTALL | re.IGNORECASE)
+    if match:
+        raw_json = match.group(1).strip()
+        try:
+            suggestions = json.loads(raw_json)
+        except Exception:
+            suggestions = re.findall(r'\"([^\"]+)\"', raw_json)
+        clean_text = response_text[:match.start()].strip()
+    
+    if not suggestions or not isinstance(suggestions, list):
+        suggestions = [
+            "¿Deseas profundizar más en este tema?",
+            "¿Qué requisitos o pasos adicionales necesitas?",
+            "¿Quieres consultar otro documento de la base?"
+        ]
+        
+    cleaned_suggestions = []
+    for s in suggestions:
+        clean_s = str(s).replace('\\', '').strip().strip('\'"')
+        if clean_s:
+            cleaned_suggestions.append(clean_s)
+
+    return clean_text, cleaned_suggestions[:3]
+
+
+def detect_and_register_lead(user_id: str, channel: str, message: str):
+    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', message)
+    phone_match = re.search(r'\+?\d{8,15}', message)
+    
+    keywords = ["cotización", "precio", "contratar", "planes", "contacto", "demo", "asesoría"]
+    is_interested = any(kw in message.lower() for kw in keywords)
+    
+    if email_match or phone_match or is_interested:
+        db_manager.save_lead(
+            user_id=user_id,
+            channel=channel,
+            name=user_id,
+            email=email_match.group(0) if email_match else None,
+            phone=phone_match.group(0) if phone_match else None,
+            interest=message[:120]
+        )
+
+
+def generate_rag_response(message: str, user_id: str = "default_user", channel: str = "web") -> Tuple[str, List[str], List[Dict[str, Any]], str, str]:
+    db_manager.save_message(user_id, channel, "user", message)
+    detect_and_register_lead(user_id, channel, message)
+
+    if not vector_store.chunks:
+        fallback_msg = "Hola. Actualmente no tengo cargada ninguna base de conocimientos para responder a tus preguntas de manera precisa. Por favor, sube un documento PDF/DOCX o añade una URL desde el panel de administración."
+        sugs = ["¿Cómo subo un documento?", "¿Cómo agrego un sitio web?", "¿Qué tipo de archivos soportas?"]
+        db_manager.save_message(user_id, channel, "assistant", fallback_msg, suggestions=sugs, model_used="none")
+        return (fallback_msg, sugs, [], "none", "none")
+
+    recent_history = db_manager.get_recent_history(user_id, limit=4)
+    history_text = ""
+    if len(recent_history) > 1:
+        history_text = "\n\nHISTORIAL CONVERSACIONAL PREVIO DEL USUARIO:\n"
+        for h in recent_history[:-1]:
+            role_label = "Usuario" if h["role"] == "user" else "Asistente"
+            history_text += f"- {role_label}: {h['content']}\n"
+
+    top_chunks_data = vector_store.query(message, top_k=4)
+
+    context_parts = []
+    sources = []
+    for chunk, score in top_chunks_data:
+        meta = chunk["metadata"]
+        context_parts.append(f"[Fuente: {meta['filename']} - Pág/Sec: {meta['page_number']}]\n{chunk['text']}")
+        sources.append({
+            "filename": meta["filename"],
+            "page_number": meta["page_number"],
+            "score": round(score, 3),
+            "text": chunk["text"]
+        })
+        
+    context_text = "\n\n---\n\n".join(context_parts)
+    
+    system_prompt = (
+        "Eres un Agente de Inteligencia Artificial experto en atención al cliente y soporte para AVFenix.\n"
+        "Tu misión principal es asesorar al usuario basándote ÚNICAMENTE en la base de conocimientos proporcionada abajo.\n\n"
+        "REGLAS CRÍTICAS DE COMPORTAMIENTO:\n"
+        "1. Ciñete estrictamente al contexto proporcionado. NO inventes hechos, cifras, enlaces, características ni respuestas.\n"
+        "2. Si la respuesta a la pregunta del usuario no está contenida explícitamente en el contexto ni es un saludo/cortesía básico, debes responder textualmente:\n"
+        "   \"Lo siento, no encuentro información sobre ese tema en mi base de conocimientos actual.\"\n"
+        "   No intentes rellenar huecos ni dar respuestas parciales basadas en tu entrenamiento previo.\n"
+        "3. Si el mensaje es un saludo común (ej. 'hola', 'buenos días', '¿qué tal?'), saluda de manera cortés, profesional y diles que estás listo para responder preguntas sobre los documentos y webs cargadas.\n"
+        "4. Mantén un tono profesional, cortés, empático y claro en español.\n"
+        "5. Al final de tus respuestas informativas, menciona brevemente las fuentes utilizadas citando el archivo o enlace de forma natural.\n"
+        "6. OBLIGATORIO AL FINAL: Incluye siempre un bloque de 3 sugerencias cortas y clickeables para que el usuario pueda avanzar. Escribe estrictamente la siguiente sintaxis al final del mensaje:\n"
+        "[SUGERENCIAS]: [\"Pregunta o acción 1\", \"Pregunta o acción 2\", \"Pregunta o acción 3\"]\n"
+        f"{history_text}\n"
+        f"CONTEXTO AUTORIZADO:\n{context_text}"
+    )
+
+    info = resolve_active_provider_and_models()
+    provider_name = info["provider"]
+    api_key = info["api_key"]
+    base_url = info["base_url"]
+    free_models = info["free_models"]
+
+    if not api_key:
+        err_msg = "Error: No se encontró clave de API configurada en .env."
+        db_manager.save_message(user_id, channel, "assistant", err_msg, model_used="none")
+        return (err_msg, [], [], "none", "none")
+
+    try:
+        max_tokens = int(os.environ.get("MAX_TOKENS", os.environ.get("OPENROUTER_MAX_TOKENS", 2000)))
+    except (ValueError, TypeError):
+        max_tokens = 2000
+
+    chat_endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "AVFenix RAG Customer Agent"
+    }
+
+    ai_response = None
+    last_error = ""
+
+    for model_name in free_models:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ],
+            "temperature": 0.1,
+            "max_tokens": max_tokens
+        }
+
+        try:
+            response = requests.post(chat_endpoint, json=payload, headers=headers, timeout=30)
+            if response.status_code != 200:
+                raise ValueError(f"HTTP {response.status_code}")
+
+            res_json = response.json()
+            if not isinstance(res_json, dict):
+                raise ValueError("Formato de respuesta inválido")
+
+            choices = res_json.get('choices', [])
+            if not choices or not isinstance(choices, list):
+                err_msg = res_json.get('error', {}).get('message', 'Sin choices')
+                raise ValueError(err_msg)
+
+            message_data = choices[0].get('message', {})
+            ai_response_raw = message_data.get('content')
+
+            if ai_response_raw is None:
+                raise ValueError("Respuesta nula del modelo")
+
+            ai_response = str(ai_response_raw).strip()
+            if not ai_response:
+                raise ValueError("Respuesta vacía del modelo")
+
+            info["active_model"] = model_name
+            break
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    if not ai_response:
+        err_fallback = f"Lo siento, ocurrió un problema temporal con el motor de IA: {last_error}"
+        db_manager.save_message(user_id, channel, "assistant", err_fallback, model_used="error")
+        return (err_fallback, [], [], provider_name, "error")
+
+    clean_response, suggestions = parse_suggestions_and_clean_text(ai_response)
+    db_manager.save_message(user_id, channel, "assistant", clean_response, suggestions=suggestions, sources=sources, model_used=info["active_model"])
+
+    return clean_response, suggestions, sources, provider_name, info["active_model"]
+
+
+# Manejo manual de CORS en Flask
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -118,8 +377,30 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET,POST,DELETE,OPTIONS'
     return response
 
+@app.route('/', methods=['GET'])
+@app.route('/dashboard', methods=['GET'])
+def serve_dashboard():
+    """Sirve la consola web interactiva del agente AVFenix."""
+    for fn in ['dashboard_web.txt', 'index.html', 'dashboard_web.html']:
+        p = os.path.abspath(os.path.join('.', fn))
+        if os.path.exists(p):
+            return send_from_directory('.', fn)
+    return jsonify({
+        "status": "healthy",
+        "message": "AVFenix Agent API activa.",
+        "endpoints": ["/api/health", "/api/chat", "/api/summarize", "/api/generate_whiteboard_video"]
+    }), 200
+
 @app.route('/api/upload', methods=['OPTIONS'])
+@app.route('/api/scrape_url', methods=['OPTIONS'])
 @app.route('/api/chat', methods=['OPTIONS'])
+@app.route('/api/summarize', methods=['OPTIONS'])
+@app.route('/api/generate_whiteboard_video', methods=['OPTIONS'])
+@app.route('/api/export_leads', methods=['OPTIONS'])
+@app.route('/api/whatsapp', methods=['OPTIONS'])
+@app.route('/api/meta_messenger', methods=['OPTIONS'])
+@app.route('/api/instagram', methods=['OPTIONS'])
+@app.route('/api/facebook', methods=['OPTIONS'])
 @app.route('/api/documents', methods=['OPTIONS'])
 @app.route('/api/delete/<path:filename>', methods=['OPTIONS'])
 def handle_options(*args, **kwargs):
@@ -127,32 +408,32 @@ def handle_options(*args, **kwargs):
 
 @app.route('/api/health', methods=['GET'])
 def health():
+    info = resolve_active_provider_and_models()
+    analytics = db_manager.get_analytics_summary()
     return jsonify({
         "status": "healthy", 
         "database_chunks": len(vector_store.chunks),
-        "active_free_model": get_available_free_model()
+        "active_provider": info["provider"],
+        "active_free_model": info["active_model"],
+        "available_free_models": info["free_models"],
+        "whatsapp_configured": bool(os.environ.get("WHATSAPP_TOKEN") and os.environ.get("WHATSAPP_PHONE_ID")),
+        "meta_messenger_configured": bool(os.environ.get("META_PAGE_ACCESS_TOKEN")),
+        "tts_engine_type": tts_engine.engine_type,
+        "analytics": analytics
     }), 200
 
 @app.route('/api/documents', methods=['GET'])
 def list_documents():
-    """
-    Retorna la lista de documentos únicos indexados en el agente.
-    """
     docs = vector_store.list_documents()
     return jsonify({"documents": docs}), 200
 
 @app.route('/api/delete/<path:filename>', methods=['DELETE'])
 def delete_document(filename):
-    """
-    Elimina un documento del índice vectorial y del almacenamiento físico.
-    """
     if not filename:
         return jsonify({"error": "Nombre de archivo no proporcionado"}), 400
         
-    # Eliminar de la base vectorial
     deleted_chunks = vector_store.delete_by_filename(filename)
     
-    # Intentar eliminar el archivo físico de uploads
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
     file_deleted = False
     if os.path.exists(file_path):
@@ -170,9 +451,6 @@ def delete_document(filename):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
-    """
-    Sube un archivo PDF o DOCX, extrae su texto mediante chunking semántico y lo indexa.
-    """
     if 'file' not in request.files:
         return jsonify({"error": "No se envió ninguna parte de archivo"}), 400
         
@@ -182,204 +460,302 @@ def upload_file():
         
     filename = secure_filename(file.filename)
     ext = filename.lower().split('.')[-1]
-    if ext not in ['pdf', 'docx', 'doc']:
-        return jsonify({"error": "Solo se permiten formatos PDF y DOCX (.docx/.doc)"}), 400
+    if ext not in ['pdf', 'docx', 'doc', 'mp4', 'mov', 'avi', 'mkv', 'mp3', 'wav', 'm4a']:
+        return jsonify({"error": "Formato no soportado. Permite PDF, Word (.docx), Video (.mp4) y Audio (.mp3)"}), 400
         
-    # Guardar archivo temporalmente
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
     
     try:
-        # Procesar y fragmentar semánticamente el documento
         chunks = processor.process_file(file_path)
-        
         if not chunks:
             return jsonify({"error": f"No se pudo extraer texto legible del archivo '{filename}'."}), 422
             
-        # Indexar chunks en la base vectorial
         vector_store.add_chunks(chunks)
-        
         return jsonify({
             "message": f"Archivo '{filename}' procesado e indexado con éxito.",
             "chunks_count": len(chunks),
             "filename": filename
         }), 200
-        
     except Exception as e:
-        print(f"Error procesando el archivo {filename}: {e}")
-        # Limpieza si falla
         if os.path.exists(file_path):
             os.remove(file_path)
         return jsonify({"error": f"Error interno al procesar el documento: {str(e)}"}), 500
 
+@app.route('/api/scrape_url', methods=['POST'])
+def scrape_url():
+    data = request.json or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "Debe proporcionar una URL válida"}), 400
+        
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = "https://" + url
+        
+    try:
+        chunks = processor.process_url(url)
+        if not chunks:
+            return jsonify({"error": f"No se pudo extraer texto legible de la URL '{url}'."}), 422
+            
+        vector_store.add_chunks(chunks)
+        filename = chunks[0]["metadata"]["filename"]
+        return jsonify({
+            "message": f"URL '{url}' scrapeada e indexada con éxito.",
+            "chunks_count": len(chunks),
+            "filename": filename
+        }), 200
+    except Exception as e:
+        return jsonify({"error": f"Error al procesar la URL: {str(e)}"}), 500
+
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """
-    Endpoint principal del chat RAG. Realiza búsqueda vectorial y consulta a OpenRouter.
-    Soporta opcionalmente output_mode = text / audio / both.
-    """
     data = request.json or {}
     message = data.get("message", "").strip()
-    output_mode = data.get("output_mode", "text") # text, audio, both
+    output_mode = data.get("output_mode", "text")
+    user_id = data.get("user_id", "web_user")
+    channel = data.get("channel", "web")
     
     if not message:
         return jsonify({"error": "El mensaje no puede estar vacío"}), 400
         
-    # 1. Comprobar si hay alguna base de conocimiento cargada en general
-    if not vector_store.chunks:
-        return jsonify({
-            "response": "Hola. Actualmente no tengo cargada ninguna base de conocimientos para responder a tus preguntas de manera precisa. Por favor, sube un documento PDF o DOCX desde el panel de administración.",
-            "sources": [],
-            "audio_url": None
-        }), 200
-
-    # 2. Recuperar los fragmentos de conocimiento más relevantes (RAG)
-    top_chunks_data = vector_store.query(message, top_k=4)
-
-    # Construir el contexto y recopilar metadatos de fuentes
-    context_parts = []
-    sources = []
-    for chunk, score in top_chunks_data:
-        meta = chunk["metadata"]
-        context_parts.append(f"[Archivo: {meta['filename']} - Pág/Sec: {meta['page_number']}]\n{chunk['text']}")
-        sources.append({
-            "filename": meta["filename"],
-            "page_number": meta["page_number"],
-            "score": round(score, 3),
-            "text": chunk["text"]
-        })
-        
-    context_text = "\n\n---\n\n".join(context_parts)
-    
-    # 3. Formular el prompt para OpenRouter con restricciones estrictas (Zero-Hallucination)
-    system_prompt = (
-        "Eres un Agente de Inteligencia Artificial experto en atención al cliente y soporte para AVFenix.\n"
-        "Tu misión principal es asesorar al usuario basándote ÚNICAMENTE en la base de conocimientos proporcionada abajo.\n\n"
-        "REGLAS CRÍTICAS DE COMPORTAMIENTO:\n"
-        "1. Ciñete estrictamente al contexto proporcionado. NO inventes hechos, cifras, enlaces, características ni respuestas.\n"
-        "2. Si la respuesta a la pregunta del usuario no está contenida explícitamente en el contexto ni es un saludo/cortesía básico, debes responder textualmente:\n"
-        "   \"Lo siento, no encuentro información sobre ese tema en mi base de conocimientos actual.\"\n"
-        "   No intentes rellenar huecos ni dar respuestas parciales basadas en tu entrenamiento previo.\n"
-        "3. Si el mensaje es un saludo común (ej. 'hola', 'buenos días', '¿qué tal?'), saluda de manera cortés, profesional y diles que estás listo para responder preguntas sobre los documentos cargados.\n"
-        "4. Mantén un tono profesional, cortés, empático y claro en español.\n"
-        "5. Al final de tus respuestas informativas, menciona brevemente las fuentes utilizadas citando el archivo y la página de forma natural.\n\n"
-        f"CONTEXTO AUTORIZADO:\n{context_text}"
+    clean_response, suggestions, sources, provider_name, active_model = generate_rag_response(
+        message, user_id=user_id, channel=channel
     )
 
-    # 4. Obtener dinámicamente el modelo gratuito disponible en OpenRouter
-    model_name = get_available_free_model()
-
-    # 5. Configurar el tamaño máximo de respuesta dinámica (Evitar recortes)
-    # Buscamos en el .env la variable OPENROUTER_MAX_TOKENS. Si no está configurada,
-    # ampliamos de 800 a 2000 tokens por defecto para permitir respuestas ricas y detalladas.
-    try:
-        max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", 2000))
-    except (ValueError, TypeError):
-        max_tokens = 2000
-
-    # 6. Llamar a la API de OpenRouter
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        return jsonify({
-            "error": "La variable de entorno OPENROUTER_API_KEY no está configurada en el servidor. No se puede consultar el LLM."
-        }), 500
-
-    openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:5000",
-        "X-Title": "AVFenix RAG Customer Agent"
-    }
-    
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message}
-        ],
-        "temperature": 0.1,  # Temperatura baja para evitar alucinaciones y respuestas creativas
-        "max_tokens": max_tokens
-    }
-    
-    ai_response = None
-    try:
-        response = requests.post(openrouter_url, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        res_json = response.json()
-        
-        choices = res_json.get('choices', [])
-        if not choices:
-            err_msg = res_json.get('error', {}).get('message', 'No se recibieron opciones válidas del modelo.')
-            raise ValueError(f"OpenRouter devolvió un error: {err_msg}")
-            
-        message_data = choices[0].get('message', {})
-        ai_response_raw = message_data.get('content')
-        
-        if ai_response_raw is None:
-            raise ValueError("El modelo devolvió una respuesta nula (None), posiblemente por bloqueo de seguridad o fallo interno.")
-            
-        ai_response = ai_response_raw.strip()
-        if not ai_response:
-            raise ValueError("El modelo devolvió un texto vacío.")
-            
-    except Exception as e:
-        print(f"Error al llamar a OpenRouter usando el modelo primario {model_name}: {e}")
-        
-        # MECANISMO DE RESPALDO DE EMERGENCIA: Si el modelo dinámico falló o devolvió None,
-        # reintentamos de forma automática e inmediata con el modelo ultra-estable de Gemini 2.5 Flash Free.
-        if model_name != "google/gemini-2.5-flash:free":
-            print("[*] Reintentando llamada de emergencia inmediata con google/gemini-2.5-flash:free...")
-            try:
-                payload["model"] = "google/gemini-2.5-flash:free"
-                payload["max_tokens"] = max_tokens
-                fallback_response = requests.post(openrouter_url, json=payload, headers=headers, timeout=30)
-                fallback_response.raise_for_status()
-                fallback_json = fallback_response.json()
-                
-                fallback_choices = fallback_json.get('choices', [])
-                if fallback_choices:
-                    fallback_content = fallback_choices[0].get('message', {}).get('content')
-                    if fallback_content is not None:
-                        ai_response = fallback_content.strip()
-                        print("[*] Reintento de emergencia exitoso usando google/gemini-2.5-flash:free")
-                        return jsonify({
-                            "response": ai_response,
-                            "sources": sources,
-                            "audio_url": None,
-                            "note": "Nota: Se utilizó un modelo de respaldo debido a un fallo en el modelo dinámico primario."
-                        }), 200
-            except Exception as inner_e:
-                print(f"[!] Falló también el reintento de emergencia: {inner_e}")
-        
-        # Si fallaron todas las opciones, devolvemos un mensaje de error estructurado
-        return jsonify({"error": f"Error de comunicación con el motor de IA ({model_name}): {str(e)}"}), 502
-
-    # 7. Pipeline de Voz (Kokoro / TTS alternativo)
     audio_url = None
-    if output_mode in ["audio", "both"] and ai_response:
-        audio_url = f"/api/tts?text={requests.utils.quote(ai_response[:200])}"
+    if output_mode in ["audio", "both"] and clean_response:
+        audio_filename = tts_engine.generate_audio(clean_response, output_dir=app.config['AUDIO_FOLDER'])
+        if audio_filename:
+            audio_url = f"/api/audio/{audio_filename}"
 
     return jsonify({
-        "response": ai_response,
+        "response": clean_response,
+        "suggestions": suggestions,
         "sources": sources,
-        "audio_url": audio_url
+        "audio_url": audio_url,
+        "provider": provider_name,
+        "model": active_model,
+        "user_id": user_id
     }), 200
+
+@app.route('/api/summarize', methods=['POST'])
+def summarize_document():
+    """Genera un resumen ejecutivo en texto y lo sintetiza en audio completo."""
+    data = request.json or {}
+    filename = data.get("filename", "").strip()
+    explicit_text = data.get("text", "").strip()
+    
+    summary_text = ""
+    title = filename or "Documento"
+    
+    if explicit_text:
+        summary_text = explicit_text
+    elif filename:
+        chunks = [c["text"] for c in vector_store.chunks if c["metadata"].get("filename") == filename]
+        if chunks:
+            full_doc = "\n".join(chunks[:8])
+            prompt = f"Por favor genera un resumen ejecutivo detallado y estructurado del siguiente texto:\n\n{full_doc}"
+            summary_text, _, _, _, _ = generate_rag_response(prompt)
+        else:
+            return jsonify({"error": f"No se encontraron fragmentos para el documento '{filename}'"}), 404
+    else:
+        prompt = "Genera un resumen general de todos los documentos indexados en la base de conocimientos."
+        summary_text, _, _, _, _ = generate_rag_response(prompt)
+
+    clean_summary = re.sub(r'\[SUGERENCIAS\]:.*', '', summary_text, flags=re.DOTALL).strip()
+    audio_filename = tts_engine.generate_audio(clean_summary, filename_prefix="summary", output_dir=app.config['AUDIO_FOLDER'])
+    audio_url = f"/api/audio/{audio_filename}" if audio_filename else None
+
+    return jsonify({
+        "title": title,
+        "summary": clean_summary,
+        "audio_url": audio_url,
+        "filename": audio_filename
+    }), 200
+
+@app.route('/api/generate_whiteboard_video', methods=['POST'])
+def generate_whiteboard_video_endpoint():
+    """Genera una presentación animada en video estilo pizarra con voz sintetizada."""
+    data = request.json or {}
+    filename = data.get("filename", "").strip()
+    explicit_text = data.get("text", "").strip()
+    
+    summary_text = ""
+    title = filename or "Resumen de Documento"
+    
+    if explicit_text:
+        summary_text = explicit_text
+    elif filename:
+        chunks = [c["text"] for c in vector_store.chunks if c["metadata"].get("filename") == filename]
+        if chunks:
+            full_doc = "\n".join(chunks[:8])
+            prompt = f"Genera un resumen en puntos clave para una presentación del documento:\n\n{full_doc}"
+            summary_text, _, _, _, _ = generate_rag_response(prompt)
+        else:
+            return jsonify({"error": f"No se encontraron fragmentos para el documento '{filename}'"}), 404
+    else:
+        prompt = "Genera un resumen en puntos clave de toda la base de conocimientos."
+        summary_text, _, _, _, _ = generate_rag_response(prompt)
+
+    clean_summary = re.sub(r'\[SUGERENCIAS\]:.*', '', summary_text, flags=re.DOTALL).strip()
+    video_filename = video_generator.generate_video(clean_summary, title=title)
+    video_url = f"/api/video/{video_filename}" if video_filename else None
+
+    return jsonify({
+        "title": title,
+        "summary": clean_summary,
+        "video_url": video_url,
+        "filename": video_filename
+    }), 200
+
+@app.route('/api/audio/<path:filename>', methods=['GET'])
+def serve_audio(filename):
+    """Sirve los archivos de audio sintetizados (.wav o .mp3)."""
+    return send_from_directory(app.config['AUDIO_FOLDER'], filename)
+
+@app.route('/api/video/<path:filename>', methods=['GET'])
+def serve_video(filename):
+    """Sirve los archivos de video estilo pizarra (.mp4)."""
+    return send_from_directory(app.config['VIDEO_FOLDER'], filename)
+
+@app.route('/api/history/<user_id>', methods=['GET'])
+def get_user_history(user_id):
+    """Retorna el historial conversacional completo guardado en SQLite para un usuario."""
+    history = db_manager.get_full_history(user_id)
+    return jsonify({"user_id": user_id, "messages": history}), 200
+
+@app.route('/api/analytics', methods=['GET'])
+def get_analytics():
+    """Retorna las métricas y analíticas globales de uso del agente multicanal."""
+    summary = db_manager.get_analytics_summary()
+    return jsonify(summary), 200
+
+@app.route('/api/export_leads', methods=['GET', 'OPTIONS'])
+def export_leads():
+    """Genera y descarga un archivo CSV con la lista completa de leads capturados."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    csv_content = db_manager.export_leads_csv()
+    return Response(
+        csv_content,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=leads_avfenix.csv"}
+    )
 
 @app.route('/api/tts', methods=['GET'])
-def tts_placeholder():
-    """
-    Ruta para la generación de audio. En un entorno de producción con Kokoro TTS,
-    aquí se cargaría el pipeline local para generar el archivo .wav y retornarlo.
-    """
+def tts_handler():
     text = request.args.get("text", "")
+    audio_filename = tts_engine.generate_audio(text, output_dir=app.config['AUDIO_FOLDER'])
+    if audio_filename:
+        audio_url = f"/api/audio/{audio_filename}"
+        return jsonify({
+            "info": f"Servicio TTS con motor {tts_engine.engine_type}.",
+            "audio_url": audio_url,
+            "filename": audio_filename
+        }), 200
+    return jsonify({"error": "No se pudo generar el archivo de audio"}), 500
+
+
+# --- ENDPOINTS DE WHATSAPP CLOUD API ---
+
+@app.route('/api/whatsapp', methods=['GET'])
+def verify_whatsapp_webhook():
+    mode = request.args.get('hub.mode', '')
+    token = request.args.get('hub.verify_token', '')
+    challenge = request.args.get('hub.challenge', '')
+
+    if whatsapp_handler.verify_token_match(mode, token):
+        print("[*] Webhook de WhatsApp verificado exitosamente con Meta.")
+        return challenge, 200
+    else:
+        print("[!] Falló la verificación del Webhook de WhatsApp: Token incorrecto.")
+        return "Error de verificación: Token no válido", 403
+
+@app.route('/api/whatsapp', methods=['POST'])
+def receive_whatsapp_message():
+    payload = request.json or {}
+    sender_phone, message_text, msg_id = whatsapp_handler.parse_incoming_payload(payload)
+
+    if not sender_phone or not message_text:
+        return jsonify({"status": "ignored"}), 200
+
+    if msg_id and msg_id in processed_message_ids:
+        return jsonify({"status": "already_processed"}), 200
+
+    if msg_id:
+        processed_message_ids.add(msg_id)
+        if len(processed_message_ids) > 1000:
+            processed_message_ids.clear()
+
+    print(f"[*] Mensaje entrante de WhatsApp (+{sender_phone}): {message_text}")
+
+    clean_response, suggestions, sources, provider, model = generate_rag_response(
+        message_text, user_id=f"wa_{sender_phone}", channel="whatsapp"
+    )
+
+    sent_success = whatsapp_handler.send_message(sender_phone, clean_response, suggestions)
+
     return jsonify({
-        "info": "Servicio de Voz Kokoro TTS.",
-        "text_to_speak": text,
-        "note": "Para producción, sustituir este handler por la llamada a kokoro.generate() y devolver un send_file de audio/wav"
+        "status": "success" if sent_success else "error_sending",
+        "recipient": sender_phone,
+        "provider_used": provider,
+        "model_used": model
     }), 200
 
+
+# --- ENDPOINTS DE INSTAGRAM DIRECT & FACEBOOK MESSENGER ---
+
+@app.route('/api/meta_messenger', methods=['GET'])
+@app.route('/api/instagram', methods=['GET'])
+@app.route('/api/facebook', methods=['GET'])
+def verify_meta_messenger_webhook():
+    mode = request.args.get('hub.mode', '')
+    token = request.args.get('hub.verify_token', '')
+    challenge = request.args.get('hub.challenge', '')
+
+    if meta_messenger_handler.verify_token_match(mode, token):
+        print("[*] Webhook de Meta Messenger/Instagram verificado exitosamente con Meta.")
+        return challenge, 200
+    else:
+        print("[!] Falló la verificación del Webhook de Meta Messenger/Instagram: Token incorrecto.")
+        return "Error de verificación: Token no válido", 403
+
+@app.route('/api/meta_messenger', methods=['POST'])
+@app.route('/api/instagram', methods=['POST'])
+@app.route('/api/facebook', methods=['POST'])
+def receive_meta_messenger_message():
+    payload = request.json or {}
+    sender_id, message_text, msg_id, platform = meta_messenger_handler.parse_incoming_payload(payload)
+
+    if not sender_id or not message_text:
+        return jsonify({"status": "ignored"}), 200
+
+    if msg_id and msg_id in processed_message_ids:
+        return jsonify({"status": "already_processed"}), 200
+
+    if msg_id:
+        processed_message_ids.add(msg_id)
+        if len(processed_message_ids) > 1000:
+            processed_message_ids.clear()
+
+    print(f"[*] Mensaje entrante de {platform.upper()} (User ID: {sender_id}): {message_text}")
+
+    user_channel_id = f"ig_{sender_id}" if platform == "instagram" else f"fb_{sender_id}"
+    clean_response, suggestions, sources, provider, model = generate_rag_response(
+        message_text, user_id=user_channel_id, channel=platform
+    )
+
+    sent_success = meta_messenger_handler.send_message(sender_id, clean_response, suggestions, platform=platform)
+
+    return jsonify({
+        "status": "success" if sent_success else "error_sending",
+        "recipient": sender_id,
+        "platform": platform,
+        "provider_used": provider,
+        "model_used": model
+    }), 200
+
+
 if __name__ == '__main__':
-    print("Iniciando Servidor AVFenix Agent Backend en http://localhost:5000")
-    # Escuchamos en todas las interfaces para permitir llamadas externas de widgets o WhatsApp
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("Iniciando Servidor AVFenix Agent Backend Fase 6 en http://localhost:5000")
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
