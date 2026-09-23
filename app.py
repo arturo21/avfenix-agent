@@ -9,9 +9,6 @@ from flask import Flask, request, jsonify, Response, send_from_directory
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
-# Evitar advertencias/fallos de CUDA si la versión del driver GPU es antigua
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
 # Cargar variables de entorno desde .env
 load_dotenv()
 
@@ -22,21 +19,25 @@ from whatsapp_handler import WhatsAppHandler
 from meta_messenger_handler import MetaMessengerHandler
 from database_manager import DatabaseManager
 from tts_engine import TTSEngine
-from video_generator import WhiteboardVideoGenerator
 
 app = Flask(__name__)
 
 # Configuración de carpetas y componentes
 UPLOAD_FOLDER = os.path.abspath("./uploads")
 AUDIO_FOLDER = os.path.abspath("./uploads/audio")
-VIDEO_FOLDER = os.path.abspath("./uploads/video")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(AUDIO_FOLDER, exist_ok=True)
-os.makedirs(VIDEO_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['AUDIO_FOLDER'] = AUDIO_FOLDER
+
+VIDEO_FOLDER = os.path.abspath("./uploads/video")
+os.makedirs(VIDEO_FOLDER, exist_ok=True)
 app.config['VIDEO_FOLDER'] = VIDEO_FOLDER
+
+from video_generator import WhiteboardVideoGenerator
+video_gen = WhiteboardVideoGenerator(output_dir=VIDEO_FOLDER)
+
 
 # Instancias principales
 VECTOR_STORE_PATH = os.path.join(UPLOAD_FOLDER, "vector_index.pkl")
@@ -46,7 +47,6 @@ whatsapp_handler = WhatsAppHandler()
 meta_messenger_handler = MetaMessengerHandler()
 db_manager = DatabaseManager(db_path=os.path.join(UPLOAD_FOLDER, "conversations.db"))
 tts_engine = TTSEngine(output_folder=AUDIO_FOLDER)
-video_generator = WhiteboardVideoGenerator(output_dir=VIDEO_FOLDER)
 
 # Control de duplicados de Webhooks
 processed_message_ids = set()
@@ -377,25 +377,11 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET,POST,DELETE,OPTIONS'
     return response
 
-@app.route('/', methods=['GET'])
-@app.route('/dashboard', methods=['GET'])
-def serve_dashboard():
-    """Sirve la consola web interactiva del agente AVFenix."""
-    for fn in ['dashboard_web.txt', 'index.html', 'dashboard_web.html']:
-        p = os.path.abspath(os.path.join('.', fn))
-        if os.path.exists(p):
-            return send_from_directory('.', fn)
-    return jsonify({
-        "status": "healthy",
-        "message": "AVFenix Agent API activa.",
-        "endpoints": ["/api/health", "/api/chat", "/api/summarize", "/api/generate_whiteboard_video"]
-    }), 200
-
+@app.route('/api/summarize', methods=['OPTIONS'])
+@app.route('/api/generate_whiteboard_video', methods=['OPTIONS'])
 @app.route('/api/upload', methods=['OPTIONS'])
 @app.route('/api/scrape_url', methods=['OPTIONS'])
 @app.route('/api/chat', methods=['OPTIONS'])
-@app.route('/api/summarize', methods=['OPTIONS'])
-@app.route('/api/generate_whiteboard_video', methods=['OPTIONS'])
 @app.route('/api/export_leads', methods=['OPTIONS'])
 @app.route('/api/whatsapp', methods=['OPTIONS'])
 @app.route('/api/meta_messenger', methods=['OPTIONS'])
@@ -405,6 +391,76 @@ def serve_dashboard():
 @app.route('/api/delete/<path:filename>', methods=['OPTIONS'])
 def handle_options(*args, **kwargs):
     return '', 200
+
+
+@app.route('/', methods=['GET'])
+@app.route('/dashboard', methods=['GET'])
+def serve_dashboard():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for fn in ['index.html', 'dashboard_web.txt', 'dashboard_web.html']:
+        for search_dir in [base_dir, '.']:
+            p = os.path.join(search_dir, fn)
+            if os.path.exists(p):
+                with open(p, 'r', encoding='utf-8') as f_in:
+                    content = f_in.read()
+                return Response(content, mimetype='text/html; charset=utf-8')
+    return jsonify({"status": "healthy", "info": "AVFenix Agent API"}), 200
+
+@app.route('/api/summarize', methods=['POST'])
+def summarize_document():
+    data = request.json or {}
+    filename = data.get("filename", "").strip()
+    
+    if filename:
+        prompt = f"Haz un resumen ejecutivo detallado y completo del documento {filename}."
+    else:
+        prompt = "Haz un resumen ejecutivo detallado y completo de la base de conocimientos."
+        
+    clean_response, suggestions, sources, provider_name, active_model = generate_rag_response(
+        prompt, user_id="summary_user", channel="web"
+    )
+    
+    audio_url = None
+    if clean_response:
+        audio_filename = tts_engine.generate_audio(clean_response, output_dir=app.config['AUDIO_FOLDER'])
+        if audio_filename:
+            audio_url = f"/api/audio/{audio_filename}"
+            
+    return jsonify({
+        "summary": clean_response,
+        "response": clean_response,
+        "audio_url": audio_url,
+        "suggestions": suggestions,
+        "sources": sources
+    }), 200
+
+@app.route('/api/generate_whiteboard_video', methods=['POST'])
+def generate_whiteboard_video_endpoint():
+    data = request.json or {}
+    filename = data.get("filename", "").strip()
+    
+    if filename:
+        prompt = f"Genera los puntos clave del documento {filename} para un resumen en video."
+    else:
+        prompt = "Genera los puntos clave de la base de conocimientos para un resumen en video."
+        
+    clean_response, suggestions, sources, provider_name, active_model = generate_rag_response(
+        prompt, user_id="video_user", channel="web"
+    )
+    
+    video_filename = video_gen.generate_video(clean_response, title=filename or "Resumen AVFenix")
+    if video_filename:
+        return jsonify({
+            "status": "success",
+            "video_filename": video_filename,
+            "video_url": f"/api/video/{video_filename}",
+            "summary_text": clean_response
+        }), 200
+    return jsonify({"error": "No se pudo generar el video pizarra"}), 500
+
+@app.route('/api/video/<path:filename>', methods=['GET'])
+def serve_video(filename):
+    return send_from_directory(app.config['VIDEO_FOLDER'], filename)
 
 @app.route('/api/health', methods=['GET'])
 def health():
@@ -460,8 +516,8 @@ def upload_file():
         
     filename = secure_filename(file.filename)
     ext = filename.lower().split('.')[-1]
-    if ext not in ['pdf', 'docx', 'doc', 'mp4', 'mov', 'avi', 'mkv', 'mp3', 'wav', 'm4a']:
-        return jsonify({"error": "Formato no soportado. Permite PDF, Word (.docx), Video (.mp4) y Audio (.mp3)"}), 400
+    if ext not in ['pdf', 'docx', 'doc']:
+        return jsonify({"error": "Solo se permiten formatos PDF y DOCX (.docx/.doc)"}), 400
         
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
@@ -538,85 +594,11 @@ def chat():
         "user_id": user_id
     }), 200
 
-@app.route('/api/summarize', methods=['POST'])
-def summarize_document():
-    """Genera un resumen ejecutivo en texto y lo sintetiza en audio completo."""
-    data = request.json or {}
-    filename = data.get("filename", "").strip()
-    explicit_text = data.get("text", "").strip()
-    
-    summary_text = ""
-    title = filename or "Documento"
-    
-    if explicit_text:
-        summary_text = explicit_text
-    elif filename:
-        chunks = [c["text"] for c in vector_store.chunks if c["metadata"].get("filename") == filename]
-        if chunks:
-            full_doc = "\n".join(chunks[:8])
-            prompt = f"Por favor genera un resumen ejecutivo detallado y estructurado del siguiente texto:\n\n{full_doc}"
-            summary_text, _, _, _, _ = generate_rag_response(prompt)
-        else:
-            return jsonify({"error": f"No se encontraron fragmentos para el documento '{filename}'"}), 404
-    else:
-        prompt = "Genera un resumen general de todos los documentos indexados en la base de conocimientos."
-        summary_text, _, _, _, _ = generate_rag_response(prompt)
-
-    clean_summary = re.sub(r'\[SUGERENCIAS\]:.*', '', summary_text, flags=re.DOTALL).strip()
-    audio_filename = tts_engine.generate_audio(clean_summary, filename_prefix="summary", output_dir=app.config['AUDIO_FOLDER'])
-    audio_url = f"/api/audio/{audio_filename}" if audio_filename else None
-
-    return jsonify({
-        "title": title,
-        "summary": clean_summary,
-        "audio_url": audio_url,
-        "filename": audio_filename
-    }), 200
-
-@app.route('/api/generate_whiteboard_video', methods=['POST'])
-def generate_whiteboard_video_endpoint():
-    """Genera una presentación animada en video estilo pizarra con voz sintetizada."""
-    data = request.json or {}
-    filename = data.get("filename", "").strip()
-    explicit_text = data.get("text", "").strip()
-    
-    summary_text = ""
-    title = filename or "Resumen de Documento"
-    
-    if explicit_text:
-        summary_text = explicit_text
-    elif filename:
-        chunks = [c["text"] for c in vector_store.chunks if c["metadata"].get("filename") == filename]
-        if chunks:
-            full_doc = "\n".join(chunks[:8])
-            prompt = f"Genera un resumen en puntos clave para una presentación del documento:\n\n{full_doc}"
-            summary_text, _, _, _, _ = generate_rag_response(prompt)
-        else:
-            return jsonify({"error": f"No se encontraron fragmentos para el documento '{filename}'"}), 404
-    else:
-        prompt = "Genera un resumen en puntos clave de toda la base de conocimientos."
-        summary_text, _, _, _, _ = generate_rag_response(prompt)
-
-    clean_summary = re.sub(r'\[SUGERENCIAS\]:.*', '', summary_text, flags=re.DOTALL).strip()
-    video_filename = video_generator.generate_video(clean_summary, title=title)
-    video_url = f"/api/video/{video_filename}" if video_filename else None
-
-    return jsonify({
-        "title": title,
-        "summary": clean_summary,
-        "video_url": video_url,
-        "filename": video_filename
-    }), 200
 
 @app.route('/api/audio/<path:filename>', methods=['GET'])
 def serve_audio(filename):
     """Sirve los archivos de audio sintetizados (.wav o .mp3)."""
     return send_from_directory(app.config['AUDIO_FOLDER'], filename)
-
-@app.route('/api/video/<path:filename>', methods=['GET'])
-def serve_video(filename):
-    """Sirve los archivos de video estilo pizarra (.mp4)."""
-    return send_from_directory(app.config['VIDEO_FOLDER'], filename)
 
 @app.route('/api/history/<user_id>', methods=['GET'])
 def get_user_history(user_id):
